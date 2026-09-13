@@ -1,409 +1,11 @@
 <!DOCTYPE html>
-<html lang="en"><head>
-    <script>
-      (function() {
-        // Capture host references before any artifact code runs: Window.parent
-        // is [Replaceable] (a top-level `var parent` in artifact code would
-        // replace the accessor with a data property), and a top-level
-        // `const crypto` would shadow the global — either would otherwise
-        // silently break the bridge for artifacts that worked before.
-        const realParent = window.parent;
-        const cryptoObj = window.crypto;
-        // html-to-image is only used by takeScreenshot: fetched on first use, not as a
-        // parser-blocking tag. Native fetch, captured before the proxy override below.
-        const realFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
-        const HTML_TO_IMAGE_SRC = "https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js";
-        const HTML_TO_IMAGE_INTEGRITY = "sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==";
-        let htmlToImageLoad = null;
-        const loadHtmlToImage = () => {
-          if (!htmlToImageLoad) {
-            htmlToImageLoad = (realFetch
-              ? realFetch(HTML_TO_IMAGE_SRC, { integrity: HTML_TO_IMAGE_INTEGRITY, credentials: 'omit', referrerPolicy: 'no-referrer' })
-              : Promise.reject(new Error('fetch unavailable'))
-            )
-              .then((res) => {
-                if (!res.ok) throw new Error('html-to-image failed to load (' + res.status + ')');
-                return res.text();
-              })
-              .then((source) => {
-                // UMD bundle: hide the artifact's AMD/CommonJS globals so it takes the
-                // window-global branch; inline script text runs synchronously on insert.
-                const hidden = ['define', 'module', 'exports'].map((k) => {
-                  const entry = { k, own: Object.prototype.hasOwnProperty.call(window, k), v: window[k] };
-                  try { window[k] = undefined; } catch (e) {}
-                  return entry;
-                });
-                try {
-                  const el = document.createElement('script');
-                  el.text = source;
-                  (document.head || document.documentElement).appendChild(el);
-                } finally {
-                  hidden.forEach(({ k, own, v }) => {
-                    try { if (own) { window[k] = v; } else { delete window[k]; } } catch (e) {}
-                  });
-                }
-                if (!window.htmlToImage) throw new Error('html-to-image unavailable after load');
-                return window.htmlToImage;
-              });
-            // A failed load may be transient; let the next screenshot retry.
-            htmlToImageLoad.catch(() => { htmlToImageLoad = null; });
-          }
-          return htmlToImageLoad;
-        };
-        // crypto.randomUUID exists only in Secure Contexts; fall back to a
-        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
-        // uniqueness is what the bridge needs, unpredictability is
-        // defense-in-depth on top of the source guards.
-        const newRequestId =
-          cryptoObj && typeof cryptoObj.randomUUID === "function"
-            ? function () { return cryptoObj.randomUUID(); }
-            : function () { return Date.now() + "-" + Math.random(); };
-        const originalConsole = window.console;
-        window.console = {
-          log: (...args) => {
-            originalConsole.log(...args);
-            realParent.postMessage({ type: 'console', message: args.join(' ') }, '*');
-          },
-          error: (...args) => {
-            originalConsole.error(...args);
-            realParent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
-          },
-          warn: (...args) => {
-            originalConsole.warn(...args);
-            realParent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
-          }
-        };
-
-        // Bridge request ids are crypto-random (not sequential) so they
-        // cannot be predicted by other frames in the tab.
-        let callbacksMap = new Map();
-        let streamControllers = new Map();
-        
-        window.claude = {
-          complete: (prompt) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
-            });
-          }
-        };
-
-        window.storage = {
-          get: (key, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
-            });
-          },
-          set: (key, value, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
-            });
-          },
-          delete: (key, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
-            });
-          },
-          list: (prefix, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
-            });
-          }
-        };
-
-        let pendingBlobs = new Map();
-        URL.createObjectURL = (blob) => {
-          // Store the blob and create an ID and URL for it
-          const blobId = `blob-${Date.now()}-${Math.random()}`;
-          pendingBlobs.set(blobId, blob);
-          return `blob-request://${blobId}`;
-        };
-
-        URL.revokeObjectURL = (url) => {
-          // Remove the blob from our store
-          const blobId = url.replace("blob-request://", "");
-          pendingBlobs.delete(blobId);
-        };
-
-        const getBlobFromURL = (url) => {
-          const blobId = url.replace("blob-request://", "");
-          return pendingBlobs.get(blobId);
-        };
-
-        // Override global fetch with streaming support
-        window.fetch = (url, init = {}) => {
-          return new Promise((resolve, reject) => {
-            const id = newRequestId();
-            const channelId = `fetch-${id}-${Date.now()}`;
-            
-            callbacksMap.set(id, { 
-              resolve: (response) => {
-                // Null-body statuses: Response(stream, {status: 204}) throws
-                // per the Fetch spec, which would escape this resolver and
-                // hang the artifact's await forever.
-                if (response.status === 204 || response.status === 205 || response.status === 304) {
-                  try {
-                    resolve(new Response(null, {
-                      status: response.status,
-                      statusText: response.statusText,
-                      headers: response.headers
-                    }));
-                  } catch (err) {
-                    // Invalid statusText/header bytes can throw here too.
-                    reject(new TypeError(
-                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
-                    ));
-                  }
-                  return;
-                }
-                // Create a ReadableStream for the response body
-                const stream = new ReadableStream({
-                  start(controller) {
-                    streamControllers.set(channelId, controller);
-                  },
-                  cancel() {
-                    streamControllers.delete(channelId);
-                  }
-                });
-                
-                // Create and return the Response with the stream. Response()
-                // requires status in [200, 599]; an opaque/no-cors fetch
-                // forwards status 0, which would throw here and escape the
-                // resolver, hanging the artifact's await. Surface it as a
-                // network-error-shaped rejection instead.
-                try {
-                  resolve(new Response(stream, {
-                    status: response.status,
-                    statusText: response.statusText,
-                    headers: response.headers
-                  }));
-                } catch (err) {
-                  streamControllers.delete(channelId);
-                  reject(new TypeError(
-                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
-                  ));
-                }
-              },
-              reject,
-              channelId
-            });
-            
-            realParent.postMessage({
-              type: 'proxyFetch',
-              id,
-              url,
-              init,
-              channelId
-            }, '*');
-          });
-        };
-
-        window.addEventListener('message', async (event) => {
-          // Only the embedding parent may drive the bridge — sibling and
-          // nested frames can also postMessage into this window.
-          if (event.source !== realParent) return;
-          if (event.data.type === 'takeScreenshot') {
-            // Echo the request's nonce so the requester can correlate the
-            // reply to ITS request — a reply without the expected nonce
-            // (e.g. from a stale pre-remount artifact) is ignored upstream.
-            const screenshotNonce = event.data.nonce;
-            const rootElement = document.getElementById('artifacts-component-root-html');
-            if (!rootElement) {
-              realParent.postMessage({
-                type: 'screenshotError',
-                nonce: screenshotNonce,
-                error: new Error('Root element not found'),
-              }, '*');
-              return;
-            }
-            // Catch CDN load failures and toPng errors so the parent always
-            // gets a response instead of hanging forever.
-            try {
-              const htmlToImage = await loadHtmlToImage();
-              const screenshot = await htmlToImage.toPng(rootElement, {
-                imagePlaceholder:
-                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
-              });
-              realParent.postMessage({
-                type: 'screenshotData',
-                nonce: screenshotNonce,
-                data: screenshot,
-              }, '*');
-            } catch (err) {
-              realParent.postMessage({
-                type: 'screenshotError',
-                nonce: screenshotNonce,
-                error: err instanceof Error ? err : new Error(String(err)),
-              }, '*');
-            }
-          } else if (event.data.type === 'claudeComplete') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.completion);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'proxyFetchResponse') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-              callbacksMap.delete(event.data.id);
-            } else {
-              // Initial response with headers, status, etc.
-              callback.resolve({
-                status: event.data.status,
-                statusText: event.data.statusText,
-                headers: event.data.headers
-              });
-              // Don't delete the callback yet if streaming
-              if (!event.data.body) {
-                callbacksMap.delete(event.data.id);
-              }
-            }
-          } else if (event.data.type === 'proxyFetchStream') {
-            // Handle streaming data chunks
-            const controller = streamControllers.get(event.data.channelId);
-            if (controller) {
-              if (event.data.error) {
-                controller.error(new Error(event.data.error));
-                streamControllers.delete(event.data.channelId);
-              } else if (event.data.done) {
-                controller.close();
-                streamControllers.delete(event.data.channelId);
-                // Clean up the callback
-                const callback = Array.from(callbacksMap.entries()).find(
-                  ([_, value]) => value.channelId === event.data.channelId
-                );
-                if (callback) {
-                  callbacksMap.delete(callback[0]);
-                }
-              } else if (event.data.chunk) {
-                controller.enqueue(new Uint8Array(event.data.chunk));
-              }
-            }
-          } else if (event.data.type === 'storageGet') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'storageSet') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'storageDelete') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'storageList') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          }
-        });
-
-        window.addEventListener('click', (event) => {
-          const isEl = event.target instanceof HTMLElement;
-          if (!isEl) return;
-    
-          // find ancestor links
-          const linkEl = event.target.closest("a");
-          if (!linkEl || !linkEl.href) return;
-    
-          event.preventDefault();
-          event.stopImmediatePropagation();
-    
-          if (linkEl.href.startsWith("blob-request:")) {
-            const blob = getBlobFromURL(linkEl.href);
-            if (!blob) return;
-            void blob.arrayBuffer().then((data) => {
-              realParent.postMessage({
-                type: "downloadFile",
-                filename: linkEl.download,
-                data,
-                mimeType: blob.type || "application/octet-stream",
-              });
-            });
-          } else if (linkEl.href.startsWith("data:")) {
-            const [header, base64Data] = linkEl.href.split(",");
-            const mimeMatch = header.match(/data:([^;]+)/);
-            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
-            const binaryString = atob(base64Data);
-            const data = Uint8Array.from(binaryString, (c) =>
-              c.charCodeAt(0),
-            ).buffer;
-            realParent.postMessage({
-              type: "downloadFile",
-              filename: linkEl.download,
-              data,
-              mimeType,
-            });
-          } else {
-            let linkUrl;
-            try {
-              linkUrl = new URL(linkEl.href);
-            } catch (error) {
-              return;
-            }
-    
-            if (linkUrl.hostname === window.location.hostname) return;
-      
-            realParent.postMessage({
-              type: 'openExternal',
-              href: linkEl.href,
-            }, '*');
-          }
-      });
-
-        const originalOpen = window.open;
-        window.open = function (url) {
-          realParent.postMessage({
-            type: "openExternal",
-            href: url,
-          }, "*");
-        };
-
-        window.addEventListener('error', (event) => {
-          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
-        });
-      })();
-    </script>
-  
+<html lang="en">
+<head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Between Leaf &amp; Clay — Participant Guide</title>
+<title>Between Leaf & Clay — Participant Guide</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,500;0,600;1,300;1,400;1,600&amp;family=Plus+Jakarta+Sans:wght@300;400;500&amp;family=Noto+Serif+TC:wght@300;400&amp;display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,500;0,600;1,300;1,400;1,600&family=Plus+Jakarta+Sans:wght@300;400;500&family=Noto+Serif+TC:wght@300;400&display=swap" rel="stylesheet">
 <style>
 /* ════════════════════════════════════════
    SOJOURN BRAND TOKENS
@@ -1246,19 +848,28 @@ body.edit-mode .edit-notice { transform: translateY(0); }
   .priority-box { flex-direction: column; gap: 0.5rem; }
 }
 
+.sojourn-link {
+  color: inherit;
+  text-decoration: none;
+  transition: color 0.2s;
+}
+.sojourn-link:hover { color: var(--q); }
 </style>
 </head>
-<body id="artifacts-component-root-html" class="">
+<body id="artifacts-component-root-html">
 
 <!-- NAV -->
-<nav id="main-nav" class="">
-  <a href="#landing" class="nav-brand">Between Leaf &amp; Clay</a>
+<nav id="main-nav">
+  <a href="#landing" class="nav-brand">Between Leaf & Clay</a>
   <ul class="nav-links">
     <li><a href="#participants">Participants</a></li>
     <li><a href="#before">Things to Know</a></li>
     <li><a href="#quick-ref">Quick Reference</a></li>
   </ul>
-  
+  <div class="edit-controls">
+    <button class="download-btn" onclick="downloadPage()">↓ Save</button>
+    <button class="edit-btn" id="edit-toggle" onclick="toggleEdit()">Edit</button>
+  </div>
 </nav>
 
 <!-- ════════════════════════════════════════
@@ -1270,24 +881,24 @@ body.edit-mode .edit-notice { transform: translateY(0); }
   <div style="background:var(--xz);position:relative;overflow:hidden;">
     <div class="hero-bg"></div>
     <div class="hero-body">
-      <p class="hero-zh" contenteditable="false" spellcheck="false">茶器之間</p>
-      <h1 class="hero-title" contenteditable="false" spellcheck="false">Between<br>Leaf<em>&amp;</em>Clay</h1>
+      <p class="hero-zh">茶器之間</p>
+      <h1 class="hero-title">Between<br>Leaf<em>&</em>Clay</h1>
       <div class="hero-facts">
         <div class="hf">
-          <span class="hf-label" contenteditable="false" spellcheck="false">Dates</span>
-          <span class="hf-value" contenteditable="false" spellcheck="false">October 24 — November 1, 2026</span>
+          <span class="hf-label">Dates</span>
+          <span class="hf-value">October 24 — November 1, 2026</span>
         </div>
         <div class="hf">
-          <span class="hf-label" contenteditable="false" spellcheck="false">Duration</span>
-          <span class="hf-value" contenteditable="false" spellcheck="false">9 days · 8 nights</span>
+          <span class="hf-label">Duration</span>
+          <span class="hf-value">9 days · 8 nights</span>
         </div>
         <div class="hf">
-          <span class="hf-label" contenteditable="false" spellcheck="false">Destinations</span>
-          <span class="hf-value" contenteditable="false" spellcheck="false">Wuyishan · Jingdezhen</span>
+          <span class="hf-label">Destinations</span>
+          <span class="hf-value">Wuyishan · Jingdezhen</span>
         </div>
         <div class="hf">
-          <span class="hf-label" contenteditable="false" spellcheck="false">Curator</span>
-          <span class="hf-value" contenteditable="false" spellcheck="false">Claudia</span>
+          <span class="hf-label">Curator</span>
+          <span class="hf-value">Claudia</span>
         </div>
       </div>
     </div>
@@ -1296,17 +907,17 @@ body.edit-mode .edit-notice { transform: translateY(0); }
   <!-- About the journey -->
   <div class="intro-section">
     <div class="intro-left">
-      <span class="s-zh" style="color:var(--qt)" contenteditable="false" spellcheck="false">关于此行</span>
-      <h2 class="s-title" contenteditable="false" spellcheck="false">A journey to where tea and clay begin</h2>
+      <span class="s-zh" style="color:var(--qt)">关于此行</span>
+      <h2 class="s-title">A journey to where tea and clay begin</h2>
       <div class="prose">
-        <p contenteditable="false" spellcheck="false">Every cup of tea tells two stories: where it was grown, and what it was made in. This journey follows both to their source.</p>
-        <p contenteditable="false" spellcheck="false">We travel first to Wuyishan (武夷山) in Fujian, the cradle of rock oolong, where tea grows in the crevices of Danxia (丹霞) cliffs and the culture of tea has accumulated over a thousand years. Then we move to Jingdezhen (景德镇) in Jiangxi, the porcelain capital of the world for seventeen centuries, where kilns still fire and artists still make.</p>
+        <p>Every cup of tea tells two stories: where it was grown, and what it was made in. This journey follows both to their source.</p>
+        <p>We travel first to Wuyishan (武夷山) in Fujian, the cradle of rock oolong, where tea grows in the crevices of Danxia (丹霞) cliffs and the culture of tea has accumulated over a thousand years. Then we move to Jingdezhen (景德镇) in Jiangxi, the porcelain capital of the world for seventeen centuries, where kilns still fire and artists still make.</p>
       </div>
     </div>
     <div class="intro-right">
-      <p class="intro-quote" contenteditable="false" spellcheck="false">"The pot remembers the hands that made it. The tea remembers the mountain."</p>
+      <p class="intro-quote">"The pot remembers the hands that made it. The tea remembers the mountain."</p>
       <div class="prose">
-        <p contenteditable="false" spellcheck="false">We move between cities by high-speed rail, a four-hour arc from one province to the next, from mountain to plain, from leaf to clay. The shift in landscape, light, and material culture is palpable.</p>
+        <p>We move between cities by high-speed rail, a four-hour arc from one province to the next, from mountain to plain, from leaf to clay. The shift in landscape, light, and material culture is palpable.</p>
       </div>
     </div>
   </div>
@@ -1314,10 +925,10 @@ body.edit-mode .edit-notice { transform: translateY(0); }
   <!-- Destinations -->
   <div class="destinations">
     <div class="dest dest-wuyi">
-      <span class="dest-zh" contenteditable="false" spellcheck="false">武夷山 · Fujian (福建)</span>
-      <h2 class="dest-title" contenteditable="false" spellcheck="false">Wuyishan</h2>
+      <span class="dest-zh">武夷山 · Fujian (福建)</span>
+      <h2 class="dest-title">Wuyishan</h2>
       <div class="dest-body">
-        <p contenteditable="false" spellcheck="false">A UNESCO World Cultural and Natural Heritage Site. The Danxia (丹霞) landscape, with red sandstone cliffs carved by the Nine Bend River (九曲溪), is the same geology that gives Wuyi rock oolong its mineral character, 岩韵 (yán yùn). The mountains also carry a thousand years of influences from the three teachings, Confucianism, Buddhism, and Taoism, a coexistence that gave Wuyishan much of its singular depth.</p>
+        <p>A UNESCO World Cultural and Natural Heritage Site. The Danxia (丹霞) landscape, with red sandstone cliffs carved by the Nine Bend River (九曲溪), is the same geology that gives Wuyi rock oolong its mineral character, 岩韵 (yán yùn). The mountains also carry a thousand years of influences from the three teachings, Confucianism, Buddhism, and Taoism, a coexistence that gave Wuyishan much of its singular depth.</p>
       </div>
       <div class="dest-facts">
         <div class="dest-fact"><span class="dest-fact-l">Province</span><span class="dest-fact-r">Fujian (福建)</span></div>
@@ -1326,10 +937,10 @@ body.edit-mode .edit-notice { transform: translateY(0); }
       </div>
     </div>
     <div class="dest dest-jdz">
-      <span class="dest-zh" contenteditable="false" spellcheck="false">景德镇 · Jiangxi (江西)</span>
-      <h2 class="dest-title" contenteditable="false" spellcheck="false">Jingdezhen</h2>
+      <span class="dest-zh">景德镇 · Jiangxi (江西)</span>
+      <h2 class="dest-title">Jingdezhen</h2>
       <div class="dest-body">
-        <p contenteditable="false" spellcheck="false">China's porcelain capital for seventeen centuries. Jingdezhen's kilns supplied the imperial court from the Song (宋) dynasty onward, and its output shaped ceramic traditions from Korea to Persia to Delft. The geological reason: fine deposits of kaolin and petuntse beneath the city, in combination, found almost nowhere else.</p>
+        <p>China's porcelain capital for seventeen centuries. Jingdezhen's kilns supplied the imperial court from the Song (宋) dynasty onward, and its output shaped ceramic traditions from Korea to Persia to Delft. The geological reason: fine deposits of kaolin and petuntse beneath the city, in combination, found almost nowhere else.</p>
       </div>
       <div class="dest-facts">
         <div class="dest-fact"><span class="dest-fact-l">Province</span><span class="dest-fact-r">Jiangxi (江西)</span></div>
@@ -1345,73 +956,68 @@ body.edit-mode .edit-notice { transform: translateY(0); }
 </div><!-- /landing -->
 
 <!-- ════════════════════════════════════════
-     ITINERARY
-════════════════════════════════════════ -->
-<!--deleted-->
-
-<!-- ════════════════════════════════════════
      PARTICIPANTS
 ════════════════════════════════════════ -->
-<section id="participants" class="">
+<section id="participants">
   <div class="section-inner">
-    <span class="s-zh" style="color:var(--qt)" contenteditable="false" spellcheck="false">同行者</span>
-    <h2 class="s-title" contenteditable="false" spellcheck="false">Participants</h2>
+    <span class="s-zh" style="color:var(--qt)">同行者</span>
+    <h2 class="s-title">Participants</h2>
     <div class="participants-grid">
 
       <div class="participant">
-        <h3 class="p-name" contenteditable="false" spellcheck="false">Amy</h3>
-        <span class="p-handle" contenteditable="false" spellcheck="false">@lit.infusions</span>
+        <h3 class="p-name">Amy</h3>
+        <span class="p-handle">@lit.infusions</span>
         <div class="p-div"></div>
-        <p class="p-bio" contenteditable="false" spellcheck="false">Hi everyone! I got into tea about three years ago after a trip to Jingmai Mountain, Yunnan with a friend, and I've been happily falling down the tea rabbit hole ever since.<br><br>Back in Vancouver, I've been lucky to find a wonderful tea community, thanks in part to Claudia's workshops, which have made the journey even more rewarding.<br><br>I can't wait to meet you all, share stories, and create new memories together over tea!</p>
+        <p class="p-bio">Hi everyone! I got into tea about three years ago after a trip to Jingmai Mountain, Yunnan with a friend, and I've been happily falling down the tea rabbit hole ever since.<br><br>Back in Vancouver, I've been lucky to find a wonderful tea community, thanks in part to Claudia's workshops, which have made the journey even more rewarding.<br><br>I can't wait to meet you all, share stories, and create new memories together over tea!</p>
       </div>
 
       <div class="participant">
-        <h3 class="p-name" contenteditable="false" spellcheck="false">Ariel</h3>
-        <span class="p-handle" contenteditable="false" spellcheck="false">@arieldrinkstea</span>
+        <h3 class="p-name">Ariel</h3>
+        <span class="p-handle">@arieldrinkstea</span>
         <div class="p-div"></div>
-        <p class="p-bio" contenteditable="false" spellcheck="false">Hello everyone! My name is Ariel and I'm thrilled to be sharing this tea journey with you all! I am a Sagittarius, ENTJ, and train Muay Thai (yes, I can help you with your luggages). I've been making pottery for nearly 2 decades (although there's still a lot to learn) and have been dedicated to tea for a long time now. It's my first time on a tea tour like this and as excited as I am to learn more about tea and the culture around it, I'm really looking forward to getting to know you all!</p>
+        <p class="p-bio">Hello everyone! My name is Ariel and I'm thrilled to be sharing this tea journey with you all! I am a Sagittarius, ENTJ, and train Muay Thai (yes, I can help you with your luggages). I've been making pottery for nearly 2 decades (although there's still a lot to learn) and have been dedicated to tea for a long time now. It's my first time on a tea tour like this and as excited as I am to learn more about tea and the culture around it, I'm really looking forward to getting to know you all!</p>
       </div>
 
       <div class="participant">
-        <h3 class="p-name" contenteditable="false" spellcheck="false">Chloe</h3>
-        <span class="p-handle" contenteditable="false" spellcheck="false">@fitsmetoatea</span>
+        <h3 class="p-name">Chloe</h3>
+        <span class="p-handle">@fitsmetoatea</span>
         <div class="p-div"></div>
-        <p class="p-bio" contenteditable="false" spellcheck="false">Hi I'm Chloe, a tea enthusiast from Singapore. I love reading and travelling, and get curious about a lot of things and tend to go down random rabbit holes, whether it's history, architecture, food, or how a place came to be the way it is.</p>
+        <p class="p-bio">Hi I'm Chloe, a tea enthusiast from Singapore. I love reading and travelling, and get curious about a lot of things and tend to go down random rabbit holes, whether it's history, architecture, food, or how a place came to be the way it is.</p>
       </div>
 
       <div class="participant">
-        <h3 class="p-name" contenteditable="false" spellcheck="false">Christine</h3>
-        <span class="p-handle" contenteditable="false" spellcheck="false">@chrissycream</span>
+        <h3 class="p-name">Christine</h3>
+        <span class="p-handle">@chrissycream</span>
         <div class="p-div"></div>
-        <p class="p-bio" contenteditable="false" spellcheck="false">Went to Wuyi at the beginning of the year and coming back for more!!!</p>
+        <p class="p-bio">Went to Wuyi at the beginning of the year and coming back for more!!!</p>
       </div>
 
       <div class="participant">
-        <h3 class="p-name" contenteditable="false" spellcheck="false">Jan</h3>
-        <span class="p-handle" contenteditable="false" spellcheck="false">@jansnochanoma</span>
+        <h3 class="p-name">Jan</h3>
+        <span class="p-handle">@jansnochanoma</span>
         <div class="p-div"></div>
-        <p class="p-bio" contenteditable="false" spellcheck="false">Hello! I'm 99% sure everyone knows who I am, so no need for an introduction here. See you all soon! - Jan</p>
+        <p class="p-bio">Hello! I'm 99% sure everyone knows who I am, so no need for an introduction here. See you all soon! - Jan</p>
       </div>
 
       <div class="participant">
-        <h3 class="p-name" contenteditable="false" spellcheck="false">Ju</h3>
-        <span class="p-handle" contenteditable="false" spellcheck="false">@onewontdo</span>
+        <h3 class="p-name">Ju</h3>
+        <span class="p-handle">@onewontdo</span>
         <div class="p-div"></div>
-        <p class="p-bio" contenteditable="false" spellcheck="false">Looking forward to sharing my passion and love for tea, art and other things adjacent!</p>
+        <p class="p-bio">Looking forward to sharing my passion and love for tea, art and other things adjacent!</p>
       </div>
 
       <div class="participant">
-        <h3 class="p-name" contenteditable="false" spellcheck="false">Paola</h3>
-        <span class="p-handle" contenteditable="false" spellcheck="false">@psimhere2</span>
+        <h3 class="p-name">Paola</h3>
+        <span class="p-handle">@psimhere2</span>
         <div class="p-div"></div>
-        <p class="p-bio" contenteditable="false" spellcheck="false">I'm originally from Mexico but now call Vancouver home. In Vancouver, I spend my time in nature, cooking food, gardening, and seeing my friends. Outside of Vancouver, you will find me diving, trekking, and enjoying local food/culture.</p>
+        <p class="p-bio">I'm originally from Mexico but now call Vancouver home. In Vancouver, I spend my time in nature, cooking food, gardening, and seeing my friends. Outside of Vancouver, you will find me diving, trekking, and enjoying local food/culture.</p>
       </div>
 
       <div class="participant">
-        <h3 class="p-name" contenteditable="false" spellcheck="false">Yuna</h3>
-        <span class="p-handle" contenteditable="false" spellcheck="false">@yuleenana</span>
+        <h3 class="p-name">Yuna</h3>
+        <span class="p-handle">@yuleenana</span>
         <div class="p-div"></div>
-        <p class="p-bio" contenteditable="false" spellcheck="false">Yuna, an avid tea enthusiast based in Seattle, Washington. While I am a software engineer by trade, I more deeply identify with my more creative pursuits—tea, ceramics, design, and music. I'd love to one day open a tea house in Seattle. In my spare time, I love organizing tea-centric events and gatherings and bringing people together in meaningful ways. Tea can be such a powerful catalyst for creativity and connection. Very much looking forward to be enamored and overwhelmed by the giant world of Chinese tea! :)</p>
+        <p class="p-bio">Yuna, an avid tea enthusiast based in Seattle, Washington. While I am a software engineer by trade, I more deeply identify with my more creative pursuits—tea, ceramics, design, and music. I'd love to one day open a tea house in Seattle. In my spare time, I love organizing tea-centric events and gatherings and bringing people together in meaningful ways. Tea can be such a powerful catalyst for creativity and connection. Very much looking forward to be enamored and overwhelmed by the giant world of Chinese tea! :)</p>
       </div>
 
     </div>
@@ -1421,77 +1027,77 @@ body.edit-mode .edit-notice { transform: translateY(0); }
 <!-- ════════════════════════════════════════
      THINGS TO KNOW BEFORE
 ════════════════════════════════════════ -->
-<section id="before" class="">
+<section id="before">
   <div class="section-inner">
-    <span class="s-zh" style="color:var(--qt)" contenteditable="false" spellcheck="false">出发前准备</span>
-    <h2 class="s-title" contenteditable="false" spellcheck="false">Things to know before</h2>
+    <span class="s-zh" style="color:var(--qt)">出发前准备</span>
+    <h2 class="s-title">Things to know before</h2>
 
     <div class="priority-box">
       <div class="priority-box-mark">!</div>
       <div>
         <strong>Install WeChat — do this now</strong>
-        <p contenteditable="false" spellcheck="false">WeChat is how we communicate as a group, how you pay for almost everything in China, and how you access DiDi (rides) and Mei Tuan (food delivery and local services). Set it up before you leave and <strong>link your credit card to WeChat Pay</strong> before the trip. Also link a card to <strong>Alipay</strong> as a backup — both WeChat Pay and Alipay now accept international Visa and Mastercard.</p>
+        <p>WeChat is how we communicate as a group, how you pay for almost everything in China, and how you access DiDi (rides) and Mei Tuan (food delivery and local services). Set it up before you leave and <strong>link your credit card to WeChat Pay</strong> before the trip. Also link a card to <strong>Alipay</strong> as a backup — both WeChat Pay and Alipay now accept international Visa and Mastercard.</p>
       </div>
     </div>
 
     <div class="know-grid">
       <div class="know-block">
-        <h3 contenteditable="false" spellcheck="false">Travel documents</h3>
+        <h3>Travel documents</h3>
         <ul>
-          <li contenteditable="false" spellcheck="false"><strong>Passport</strong> — valid at least 6 months beyond November 1, 2026</li>
-          <li contenteditable="false" spellcheck="false"><strong>Chinese visa</strong> — many nationalities now qualify for visa-free entry. Confirm your eligibility. This policy changes frequently — verify with a recent source, not information older than a few months</li>
-          <li contenteditable="false" spellcheck="false"><strong>Travel insurance</strong> — required. Should cover medical, cancellation, and lost luggage</li>
-          <li contenteditable="false" spellcheck="false"><strong>Printed copies</strong> — carry printed copies of passport, visa, and insurance. Accommodation registration requires your passport at every check-in</li>
+          <li><strong>Passport</strong> — valid at least 6 months beyond November 1, 2026</li>
+          <li><strong>Chinese visa</strong> — many nationalities now qualify for visa-free entry. Confirm your eligibility. This policy changes frequently — verify with a recent source, not information older than a few months</li>
+          <li><strong>Travel insurance</strong> — required. Should cover medical, cancellation, and lost luggage</li>
+          <li><strong>Printed copies</strong> — carry printed copies of passport, visa, and insurance. Accommodation registration requires your passport at every check-in</li>
         </ul>
       </div>
 
       <div class="know-block">
-        <h3 contenteditable="false" spellcheck="false">Apps to install</h3>
+        <h3>Apps to install</h3>
         <ul>
-          <li contenteditable="false" spellcheck="false"><strong>WeChat</strong> — communication, payments, QR codes, DiDi, Mei Tuan. The most essential app for China</li>
-          <li contenteditable="false" spellcheck="false"><strong>Alipay</strong> — secondary payments. Link an international card before you arrive</li>
-          <li contenteditable="false" spellcheck="false"><strong>VPN</strong> — install and test before landing. Cannot be downloaded once inside China. Google, Instagram, and most Western apps are blocked without one</li>
-          <li contenteditable="false" spellcheck="false"><strong>Amap (高德地图)</strong> — China's standard mapping app. Google Maps does not work reliably</li>
+          <li><strong>WeChat</strong> — communication, payments, QR codes, DiDi, Mei Tuan. The most essential app for China</li>
+          <li><strong>Alipay</strong> — secondary payments. Link an international card before you arrive</li>
+          <li><strong>VPN</strong> — install and test before landing. Cannot be downloaded once inside China. Google, Instagram, and most Western apps are blocked without one</li>
+          <li><strong>Amap (高德地图)</strong> — China's standard mapping app. Google Maps does not work reliably</li>
         </ul>
         <div class="warn-box">Set up all apps and test your VPN before you land. Once in China, you are behind the Great Firewall and cannot download blocked services.</div>
       </div>
 
       <div class="know-block">
-        <h3 contenteditable="false" spellcheck="false">Data &amp; SIM</h3>
+        <h3>Data & SIM</h3>
         <ul>
-          <li contenteditable="false" spellcheck="false"><strong>eSIM (recommended)</strong> — Trip.com sells China-compatible eSIMs that are easy to install before departure. Arrive already connected. Works with most modern unlocked phones</li>
-          <li contenteditable="false" spellcheck="false"><strong>Physical SIM at the airport</strong> — available from China Mobile and China Unicom on arrival, requires passport. Note: by the time you buy it at the airport, you are already behind the Firewall — install any VPNs and apps before landing</li>
-          <li contenteditable="false" spellcheck="false"><strong>International roaming</strong> — works, but data costs can be high. Check your carrier's China plan before departure</li>
+          <li><strong>eSIM (recommended)</strong> — Trip.com sells China-compatible eSIMs that are easy to install before departure. Arrive already connected. Works with most modern unlocked phones</li>
+          <li><strong>Physical SIM at the airport</strong> — available from China Mobile and China Unicom on arrival, requires passport. Note: by the time you buy it at the airport, you are already behind the Firewall — install any VPNs and apps before landing</li>
+          <li><strong>International roaming</strong> — works, but data costs can be high. Check your carrier's China plan before departure</li>
         </ul>
         <div class="note-box">The group WeChat runs all logistics throughout the trip. A working data connection from Day 1 is important.</div>
       </div>
 
       <div class="know-block">
-        <h3 contenteditable="false" spellcheck="false">Money</h3>
+        <h3>Money</h3>
         <ul>
-          <li contenteditable="false" spellcheck="false"><strong>WeChat Pay and Alipay</strong> — nearly all transactions in China: street food, markets, temples, taxis. Link an international Visa or Mastercard before you arrive</li>
-          <li contenteditable="false" spellcheck="false"><strong>Cash RMB (¥)</strong> — carry some. ¥500–1,000 in small bills covers older establishments and rural spots that don't take mobile payment</li>
-          <li contenteditable="false" spellcheck="false"><strong>ATMs</strong> — Bank of China and ICBC are most reliable for international cards. Notify your bank before departure to avoid security blocks</li>
+          <li><strong>WeChat Pay and Alipay</strong> — nearly all transactions in China: street food, markets, temples, taxis. Link an international Visa or Mastercard before you arrive</li>
+          <li><strong>Cash RMB (¥)</strong> — carry some. ¥500–1,000 in small bills covers older establishments and rural spots that don't take mobile payment</li>
+          <li><strong>ATMs</strong> — Bank of China and ICBC are most reliable for international cards. Notify your bank before departure to avoid security blocks</li>
         </ul>
       </div>
 
       <div class="know-block">
-        <h3 contenteditable="false" spellcheck="false">Weather &amp; packing</h3>
+        <h3>Weather & packing</h3>
         <ul>
-          <li contenteditable="false" spellcheck="false"><strong>Wuyishan</strong> — 13–22°C (55–72°F). Cooler mornings and evenings, perfect for hiking through the tea mountains. October is one of the drier, more comfortable months</li>
-          <li contenteditable="false" spellcheck="false"><strong>Jingdezhen</strong> — 10–25°C (50–77°F), dropping noticeably toward end of October</li>
-          <li contenteditable="false" spellcheck="false"><strong>Layers</strong> — the gap between morning and afternoon is real. Light down or fleece, breathable mid-layers</li>
-          <li contenteditable="false" spellcheck="false"><strong>Windbreaker</strong> — useful on the river raft and mountain trails</li>
-          <li contenteditable="false" spellcheck="false"><strong>Comfortable walking shoes</strong> — cobblestones, trails, studio paths. Comfort over style</li>
+          <li><strong>Wuyishan</strong> — 13–22°C (55–72°F). Cooler mornings and evenings, perfect for hiking through the tea mountains. October is one of the drier, more comfortable months</li>
+          <li><strong>Jingdezhen</strong> — 10–25°C (50–77°F), dropping noticeably toward end of October</li>
+          <li><strong>Layers</strong> — the gap between morning and afternoon is real. Light down or fleece, breathable mid-layers</li>
+          <li><strong>Windbreaker</strong> — useful on the river raft and mountain trails</li>
+          <li><strong>Comfortable walking shoes</strong> — cobblestones, trails, studio paths. Comfort over style</li>
         </ul>
       </div>
 
       <div class="know-block">
-        <h3 contenteditable="false" spellcheck="false">Health &amp; practical</h3>
+        <h3>Health & practical</h3>
         <ul>
-          <li contenteditable="false" spellcheck="false"><strong>Medications</strong> — bring a sufficient supply. Include a note or prescription if possible</li>
-          <li contenteditable="false" spellcheck="false"><strong>Physical level</strong> — easy to moderate. No vigorous hiking.</li>
-          <li contenteditable="false" spellcheck="false"><strong>Electricity</strong> — 220V, Type A/C/I outlets. Most devices charge via USB. Universal adapter recommended</li>
+          <li><strong>Medications</strong> — bring a sufficient supply. Include a note or prescription if possible</li>
+          <li><strong>Physical level</strong> — easy to moderate. No vigorous hiking.</li>
+          <li><strong>Electricity</strong> — 220V, Type A/C/I outlets. Most devices charge via USB. Universal adapter recommended</li>
         </ul>
       </div>
     </div>
@@ -1506,56 +1112,56 @@ body.edit-mode .edit-notice { transform: translateY(0); }
 <!-- ════════════════════════════════════════
      QUICK REFERENCE
 ════════════════════════════════════════ -->
-<section id="quick-ref" class="">
+<section id="quick-ref">
   <div class="section-inner">
-    <span class="s-zh" contenteditable="false" spellcheck="false">快速参考</span>
-    <h2 class="s-title" contenteditable="false" spellcheck="false">Quick reference</h2>
+    <span class="s-zh">快速参考</span>
+    <h2 class="s-title">Quick reference</h2>
 
     <div class="qr-grid">
 
       <div class="qr-block">
-        <h3 contenteditable="false" spellcheck="false">Accommodation</h3>
-        <div class="qr-row-item"><span class="qr-label" contenteditable="false" spellcheck="false">Hotel — Wuyishan</span><span class="qr-val qr-tbc" contenteditable="false" spellcheck="false">隐山堂茶美学空间</span></div>
-        <div class="qr-row-item"><span class="qr-label" contenteditable="false" spellcheck="false">Hotel — Jingdezhen</span><span class="qr-val qr-tbc" contenteditable="false" spellcheck="false">溪川行廬</span></div>
+        <h3>Accommodation</h3>
+        <div class="qr-row-item"><span class="qr-label">Hotel — Wuyishan</span><span class="qr-val qr-tbc">隐山堂茶美学空间</span></div>
+        <div class="qr-row-item"><span class="qr-label">Hotel — Jingdezhen</span><span class="qr-val qr-tbc">溪川行廬</span></div>
       </div>
 
       <div class="qr-block">
-        <h3 contenteditable="false" spellcheck="false">Transport</h3>
-        <div class="qr-row-item"><span class="qr-label" contenteditable="false" spellcheck="false">Wuyishan station</span><span class="qr-val" contenteditable="false" spellcheck="false">武夷山北站 (North)</span></div>
-        <div class="qr-row-item"><span class="qr-label" contenteditable="false" spellcheck="false">Wuyishan airport</span><span class="qr-val" contenteditable="false" spellcheck="false">WUS</span></div>
-        <div class="qr-row-item"><span class="qr-label" contenteditable="false" spellcheck="false">Jingdezhen station</span><span class="qr-val" contenteditable="false" spellcheck="false">景德镇北站 (North)</span></div>
-        <div class="qr-row-item"><span class="qr-label" contenteditable="false" spellcheck="false">Rides</span><span class="qr-val" contenteditable="false" spellcheck="false">DiDi (via WeChat)</span></div>
+        <h3>Transport</h3>
+        <div class="qr-row-item"><span class="qr-label">Wuyishan station</span><span class="qr-val">武夷山北站 (North)</span></div>
+        <div class="qr-row-item"><span class="qr-label">Wuyishan airport</span><span class="qr-val">WUS</span></div>
+        <div class="qr-row-item"><span class="qr-label">Jingdezhen station</span><span class="qr-val">景德镇北站 (North)</span></div>
+        <div class="qr-row-item"><span class="qr-label">Rides</span><span class="qr-val">DiDi (via WeChat)</span></div>
       </div>
 
       <!--deleted-->
 
       <div class="qr-block">
-        <h3 contenteditable="false" spellcheck="false">Emergency numbers</h3>
+        <h3>Emergency numbers</h3>
         <ul class="emergency-list">
-          <li><span class="em-label" contenteditable="false" spellcheck="false">Police</span><span class="em-num" contenteditable="false" spellcheck="false">110</span></li>
-          <li><span class="em-label" contenteditable="false" spellcheck="false">Ambulance</span><span class="em-num" contenteditable="false" spellcheck="false">120</span></li>
-          <li><span class="em-label" contenteditable="false" spellcheck="false">Fire</span><span class="em-num" contenteditable="false" spellcheck="false">119</span></li>
-          <li><span class="em-label" contenteditable="false" spellcheck="false">Tourist helpline</span><span class="em-num" contenteditable="false" spellcheck="false">12301</span></li>
+          <li><span class="em-label">Police</span><span class="em-num">110</span></li>
+          <li><span class="em-label">Ambulance</span><span class="em-num">120</span></li>
+          <li><span class="em-label">Fire</span><span class="em-num">119</span></li>
+          <li><span class="em-label">Tourist helpline</span><span class="em-num">12301</span></li>
         </ul>
       </div>
 
       <div class="qr-block">
-        <h3 contenteditable="false" spellcheck="false">Payments &amp; practical</h3>
-        <div class="qr-row-item"><span class="qr-label" contenteditable="false" spellcheck="false">Currency</span><span class="qr-val" contenteditable="false" spellcheck="false">RMB (¥)</span></div>
-        <div class="qr-row-item"><span class="qr-label" contenteditable="false" spellcheck="false">Mobile payment</span><span class="qr-val" contenteditable="false" spellcheck="false">WeChat Pay · Alipay</span></div>
-        <div class="qr-row-item"><span class="qr-label" contenteditable="false" spellcheck="false">Time zone</span><span class="qr-val" contenteditable="false" spellcheck="false">UTC+8 (CST)</span></div>
-        <div class="qr-row-item"><span class="qr-label" contenteditable="false" spellcheck="false">Electricity</span><span class="qr-val" contenteditable="false" spellcheck="false">220V · Type A/C/I</span></div>
-        <div class="qr-row-item"><span class="qr-label" contenteditable="false" spellcheck="false">Language</span><span class="qr-val" contenteditable="false" spellcheck="false">Mandarin (普通话)</span></div>
+        <h3>Payments & practical</h3>
+        <div class="qr-row-item"><span class="qr-label">Currency</span><span class="qr-val">RMB (¥)</span></div>
+        <div class="qr-row-item"><span class="qr-label">Mobile payment</span><span class="qr-val">WeChat Pay · Alipay</span></div>
+        <div class="qr-row-item"><span class="qr-label">Time zone</span><span class="qr-val">UTC+8 (CST)</span></div>
+        <div class="qr-row-item"><span class="qr-label">Electricity</span><span class="qr-val">220V · Type A/C/I</span></div>
+        <div class="qr-row-item"><span class="qr-label">Language</span><span class="qr-val">Mandarin (普通话)</span></div>
       </div>
 
       <div class="qr-block">
-        <h3 contenteditable="false" spellcheck="false">Key apps</h3>
-        <div class="qr-row-item"><span class="qr-label" contenteditable="false" spellcheck="false">Communication + pay</span><span class="qr-val" contenteditable="false" spellcheck="false">WeChat</span></div>
-        <div class="qr-row-item"><span class="qr-label" contenteditable="false" spellcheck="false">Backup payment</span><span class="qr-val" contenteditable="false" spellcheck="false">Alipay</span></div>
-        <div class="qr-row-item"><span class="qr-label" contenteditable="false" spellcheck="false">Rides</span><span class="qr-val" contenteditable="false" spellcheck="false">DiDi (via WeChat)</span></div>
-        <div class="qr-row-item"><span class="qr-label" contenteditable="false" spellcheck="false">Maps</span><span class="qr-val" contenteditable="false" spellcheck="false">Amap (高德地图)</span></div>
-        <div class="qr-row-item"><span class="qr-label" contenteditable="false" spellcheck="false">eSIM</span><span class="qr-val" contenteditable="false" spellcheck="false">Trip.com</span></div>
-        <div class="qr-row-item"><span class="qr-label" contenteditable="false" spellcheck="false">Train booking</span><span class="qr-val" contenteditable="false" spellcheck="false">12306 · Trip.com</span></div>
+        <h3>Key apps</h3>
+        <div class="qr-row-item"><span class="qr-label">Communication + pay</span><span class="qr-val">WeChat</span></div>
+        <div class="qr-row-item"><span class="qr-label">Backup payment</span><span class="qr-val">Alipay</span></div>
+        <div class="qr-row-item"><span class="qr-label">Rides</span><span class="qr-val">DiDi (via WeChat)</span></div>
+        <div class="qr-row-item"><span class="qr-label">Maps</span><span class="qr-val">Amap (高德地图)</span></div>
+        <div class="qr-row-item"><span class="qr-label">eSIM</span><span class="qr-val">Trip.com</span></div>
+        <div class="qr-row-item"><span class="qr-label">Train booking</span><span class="qr-val">12306 · Trip.com</span></div>
       </div>
 
     </div>
@@ -1566,8 +1172,8 @@ body.edit-mode .edit-notice { transform: translateY(0); }
 </section>
 
 <footer>
-  <p class="footer-l" contenteditable="false" spellcheck="false">Between Leaf &amp; Clay · Oct 24–Nov 1, 2026 · Curated by Claudia Tse&nbsp; <a href="http://www.littlesojourn.com">littlesojourn.com</a></p>
-  <p class="footer-r" contenteditable="false" spellcheck="false">茶器之間 · 武夷山 · 景德镇</p>
+  <p class="footer-l">Between Leaf & Clay · Oct 24–Nov 1, 2026 · Curated by Claudia Tse  <a href="https://www.littlesojourn.com" class="sojourn-link">www.littlesojourn.com</a></p>
+  <p class="footer-r">茶器之間 · 武夷山 · 景德镇</p>
 </footer>
 
 <script>
@@ -1738,7 +1344,6 @@ function downloadPage() {
 
 document.addEventListener('DOMContentLoaded', () => {
   addDeleteButtons();
-  toggleEdit(); // auto-start in edit mode
 
   /* Notice bar */
   const notice = document.createElement('div');
