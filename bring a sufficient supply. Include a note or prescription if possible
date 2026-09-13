@@ -907,7 +907,6 @@ body.edit-mode .edit-notice { transform: translateY(0); }
   <!-- About the journey -->
   <div class="intro-section">
     <div class="intro-left">
-      <span class="s-zh" style="color:var(--qt)">关于此行</span>
       <h2 class="s-title">A journey to where tea and clay begin</h2>
       <div class="prose">
         <p>Every cup of tea tells two stories: where it was grown, and what it was made in. This journey follows both to their source.</p>
@@ -960,7 +959,6 @@ body.edit-mode .edit-notice { transform: translateY(0); }
 ════════════════════════════════════════ -->
 <section id="participants">
   <div class="section-inner">
-    <span class="s-zh" style="color:var(--qt)">同行者</span>
     <h2 class="s-title">Participants</h2>
     <div class="participants-grid">
 
@@ -1029,7 +1027,6 @@ body.edit-mode .edit-notice { transform: translateY(0); }
 ════════════════════════════════════════ -->
 <section id="before">
   <div class="section-inner">
-    <span class="s-zh" style="color:var(--qt)">出发前准备</span>
     <h2 class="s-title">Things to know before</h2>
 
     <div class="priority-box">
@@ -1095,7 +1092,7 @@ body.edit-mode .edit-notice { transform: translateY(0); }
       <div class="know-block">
         <h3>Health & practical</h3>
         <ul>
-          <li><strong>Medications</strong> — bring a sufficient supply. Include a note or prescription if possible</li>
+          <li><strong>Medications</strong> — bring a sufficient supply. Bring any common medications you may need, especially for colds, headaches/pain, stomach issues, etc. I’d also recommend bringing throat drops or honey lozenges, as Jingdezhen can be quite dry and dusty. </li>
           <li><strong>Physical level</strong> — easy to moderate. No vigorous hiking.</li>
           <li><strong>Electricity</strong> — 220V, Type A/C/I outlets. Most devices charge via USB. Universal adapter recommended</li>
         </ul>
@@ -1114,7 +1111,6 @@ body.edit-mode .edit-notice { transform: translateY(0); }
 ════════════════════════════════════════ -->
 <section id="quick-ref">
   <div class="section-inner">
-    <span class="s-zh">快速参考</span>
     <h2 class="s-title">Quick reference</h2>
 
     <div class="qr-grid">
