@@ -1,0 +1,558 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>九曲溪 — Nine Bend River</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,500;1,300;1,400&family=Plus+Jakarta+Sans:wght@300;400;500&family=Noto+Serif+TC:wght@300;400&display=swap" rel="stylesheet">
+<style>
+:root {
+  --xz:  #EDE5D8;
+  --mo:  #1E1B16;
+  --ch:  #8B6344;
+  --cht: #6A4628;
+  --q:   #568A86;
+  --qt:  #38696A;
+  --ma:  #A89070;
+  --sg:  #8A8478;
+  --nb:  #E4D8C4;
+  --serif: "Cormorant Garamond", serif;
+  --sans:  "Plus Jakarta Sans", sans-serif;
+  --tc:    "Noto Serif TC", serif;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { -webkit-font-smoothing: antialiased; }
+
+body {
+  background: var(--xz);
+  color: var(--mo);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.9;
+  font-weight: 300;
+}
+
+/* ── HERO ── */
+.hero {
+  padding: 9vw 8vw 6vw;
+  border-bottom: 1px solid rgba(139,99,68,.18);
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6vw;
+  align-items: end;
+}
+.hero-left {}
+.hero-eyebrow {
+  font-family: var(--tc);
+  font-size: 11px;
+  letter-spacing: 0.2em;
+  color: var(--qt);
+  font-weight: 300;
+  margin-bottom: 1.4rem;
+  display: block;
+}
+.hero-zh {
+  font-family: var(--tc);
+  font-size: clamp(72px, 14vw, 160px);
+  font-weight: 300;
+  line-height: 0.9;
+  letter-spacing: 0.08em;
+  color: var(--mo);
+  margin-bottom: 1.2rem;
+}
+.hero-title {
+  font-family: var(--serif);
+  font-size: clamp(18px, 2.2vw, 26px);
+  font-weight: 300;
+  font-style: italic;
+  color: var(--ch);
+  letter-spacing: 0.01em;
+  line-height: 1.4;
+}
+.hero-right {
+  padding-bottom: 0.5rem;
+}
+.hero-desc {
+  font-size: 14px;
+  line-height: 1.9;
+  color: #52483E;
+  max-width: 48ch;
+  margin-bottom: 2rem;
+}
+.hero-facts {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1px;
+  background: rgba(139,99,68,.14);
+}
+.hf {
+  background: var(--xz);
+  padding: 0.9rem 1rem;
+}
+.hf-label {
+  font-family: var(--tc);
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  color: var(--ma);
+  display: block;
+  margin-bottom: 0.2rem;
+  font-weight: 300;
+}
+.hf-value {
+  font-size: 13px;
+  color: var(--mo);
+}
+
+/* ── HISTORY ── */
+.history {
+  padding: 6vw 8vw;
+  display: grid;
+  grid-template-columns: 280px 1fr;
+  gap: 6vw;
+  align-items: start;
+  border-bottom: 1px solid rgba(139,99,68,.18);
+  background: var(--nb);
+}
+.history-label {
+  font-family: var(--tc);
+  font-size: 11px;
+  letter-spacing: 0.2em;
+  color: var(--qt);
+  display: block;
+  margin-bottom: 1.4rem;
+  font-weight: 300;
+}
+.history-head {
+  font-family: var(--serif);
+  font-size: clamp(24px, 3vw, 36px);
+  font-weight: 300;
+  line-height: 1.15;
+  letter-spacing: -0.01em;
+  margin-bottom: 2rem;
+  color: var(--mo);
+}
+.history-body {
+  font-size: 14px;
+  line-height: 1.9;
+  color: #52483E;
+}
+.history-body p { margin-bottom: 1.1rem; }
+.history-body p:last-child { margin: 0; }
+.history-quote {
+  font-family: var(--serif);
+  font-size: clamp(17px, 2vw, 22px);
+  font-style: italic;
+  font-weight: 300;
+  color: var(--ch);
+  border-left: 1px solid rgba(139,99,68,.35);
+  padding-left: 1.4rem;
+  line-height: 1.5;
+  margin-bottom: 1.6rem;
+}
+.history-cite {
+  font-family: var(--tc);
+  font-size: 11px;
+  color: var(--sg);
+  letter-spacing: 0.08em;
+  display: block;
+  margin-top: 0.5rem;
+}
+
+/* ── BENDS HEADER ── */
+.bends-header {
+  padding: 5vw 8vw 3vw;
+  border-bottom: 1px solid rgba(139,99,68,.18);
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 2rem;
+  flex-wrap: wrap;
+}
+.bends-header-left {}
+.bends-label {
+  font-family: var(--tc);
+  font-size: 11px;
+  letter-spacing: 0.2em;
+  color: var(--qt);
+  display: block;
+  margin-bottom: 0.6rem;
+  font-weight: 300;
+}
+.bends-title {
+  font-family: var(--serif);
+  font-size: clamp(22px, 3vw, 36px);
+  font-weight: 300;
+  letter-spacing: -0.01em;
+  line-height: 1.1;
+}
+.bends-note {
+  font-size: 13px;
+  color: var(--sg);
+  font-style: italic;
+  max-width: 38ch;
+  text-align: right;
+  line-height: 1.6;
+}
+
+/* ── BEND ENTRIES ── */
+.bends {
+  padding: 0 8vw;
+}
+.bend {
+  display: grid;
+  grid-template-columns: 120px 1fr;
+  gap: 0;
+  border-bottom: 1px solid rgba(139,99,68,.12);
+  padding: 2.4rem 0;
+}
+.bend:last-child { border-bottom: none; }
+.bend-num-col {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  padding-top: 0.2rem;
+  padding-right: 2rem;
+}
+.bend-num-zh {
+  font-family: var(--tc);
+  font-size: 52px;
+  font-weight: 300;
+  line-height: 1;
+  color: rgba(139,99,68,.2);
+  margin-bottom: 0.3rem;
+}
+.bend-num-en {
+  font-family: var(--sans);
+  font-size: 10px;
+  font-weight: 400;
+  color: var(--ma);
+  letter-spacing: 0.1em;
+}
+.bend-content {}
+.bend-cliff {
+  display: flex;
+  align-items: baseline;
+  gap: 0.7rem;
+  margin-bottom: 0.6rem;
+  flex-wrap: wrap;
+}
+.bend-cliff-zh {
+  font-family: var(--tc);
+  font-size: 15px;
+  font-weight: 400;
+  color: var(--mo);
+  letter-spacing: 0.06em;
+}
+.bend-cliff-en {
+  font-family: var(--serif);
+  font-size: 17px;
+  font-weight: 400;
+  color: var(--mo);
+  font-style: italic;
+  letter-spacing: 0.01em;
+}
+.bend-cliff-sep {
+  width: 1px;
+  height: 13px;
+  background: rgba(139,99,68,.25);
+  align-self: center;
+}
+.bend-body {
+  font-size: 13.5px;
+  line-height: 1.85;
+  color: #52483E;
+  max-width: 68ch;
+}
+.bend-look {
+  margin-top: 0.8rem;
+  padding: 0.65rem 0.9rem;
+  border-left: 2px solid rgba(86,138,134,.4);
+  background: rgba(86,138,134,.04);
+  font-size: 12.5px;
+  color: #52483E;
+  line-height: 1.7;
+  font-style: italic;
+}
+.bend-look strong {
+  font-style: normal;
+  font-weight: 400;
+  color: var(--qt);
+}
+
+/* ── FOOTER ── */
+.footer {
+  background: var(--nb);
+  border-top: 1px solid rgba(139,99,68,.18);
+  padding: 2rem 8vw;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1.5rem;
+  flex-wrap: wrap;
+}
+.footer-l {
+  font-family: var(--serif);
+  font-size: 13px;
+  font-weight: 300;
+  color: var(--sg);
+}
+.footer-r {
+  font-family: var(--tc);
+  font-size: 10px;
+  color: var(--ma);
+  letter-spacing: 0.14em;
+  font-weight: 300;
+}
+
+/* ── RESPONSIVE ── */
+@media (max-width: 800px) {
+  .hero { grid-template-columns: 1fr; gap: 2.5rem; }
+  .history { grid-template-columns: 1fr; gap: 2rem; }
+  .bends-header { flex-direction: column; gap: 0.8rem; }
+  .bends-note { text-align: left; }
+  .bend { grid-template-columns: 72px 1fr; }
+  .bend-num-zh { font-size: 36px; }
+}
+@media (max-width: 480px) {
+  .hero, .history, .bends-header { padding-left: 6vw; padding-right: 6vw; }
+  .bends { padding: 0 6vw; }
+  .footer { padding: 1.6rem 6vw; }
+}
+
+
+
+.footer-journey {
+  font-family: var(--sans);
+  font-size: 11px;
+  color: var(--sg);
+  font-weight: 300;
+}
+</style>
+</head>
+<body>
+
+<!-- HERO -->
+<header class="hero">
+  <div class="hero-left">
+    <span class="hero-eyebrow">武夷山 · Wuyishan, Fujian</span>
+    <div class="hero-zh">九曲溪</div>
+    <p class="hero-title">Nine Bend River — A guide for the bamboo raft</p>
+  </div>
+  <div class="hero-right">
+    <p class="hero-desc">The raft departs from the Ninth Bend at Xingcun (星村) and drifts downstream to the First Bend at Wuyi Palace (武夷宫) — 9.5 kilometres, nine bends, two boatmen, and roughly ninety minutes. Each bend is marked in red calligraphy on the cliff face, counting down: 九 to 一. The river does not move in a straight line. It turns. And in every turning, something is revealed.</p>
+    <div class="hero-facts">
+      <div class="hf">
+        <span class="hf-label">Distance</span>
+        <span class="hf-value">9.5 km</span>
+      </div>
+      <div class="hf">
+        <span class="hf-label">Duration</span>
+        <span class="hf-value">~90 minutes</span>
+      </div>
+      <div class="hf">
+        <span class="hf-label">Direction</span>
+        <span class="hf-value">Ninth → First Bend</span>
+      </div>
+      <div class="hf">
+        <span class="hf-label">UNESCO</span>
+        <span class="hf-value">World Heritage, 1999</span>
+      </div>
+    </div>
+  </div>
+</header>
+
+<!-- HISTORY -->
+<section class="history">
+  <div>
+    <span class="history-label">歷史</span>
+    <h2 class="history-head">Three thousand years on this water</h2>
+    <div class="history-quote">
+      "A single stream threads through a multitude of mountains; clear and shallow, it winds through nine bends."
+      <cite class="history-cite">— Classical verse on the Nine Bend River</cite>
+    </div>
+  </div>
+  <div class="history-body">
+    <p>The river exists, according to legend, because of two brothers. In ancient times, floods threatened the region so severely that Peng Zu (彭祖) — the mythological elder of longevity — sent his sons Peng Wu (彭武) and Peng Yi (彭夷) to carve a channel through the mountains. They worked without rest for 365 days. The river they created took their names: Wu-Yi. The mountains it flows through became Wuyishan (武夷山).</p>
+    <p>The oldest human presence on this river predates that legend by centuries. The hanging coffins visible at the Third and Fourth Bends — boat-shaped wooden caskets wedged into cliff niches at heights nobody has explained — date to at least 1000 BCE. The civilisation that placed them here left no other record of itself. Only the coffins, still in the cliffs, after three thousand years.</p>
+    <p>In 1184 CE, the Neo-Confucian philosopher Zhu Xi (朱熹) was rowed along this water with friends. What he saw moved him to write the Nine-Bend Boatman's Songs (九曲棹歌) — a poem for each bend — which he had carved directly into the cliff faces. At the Fifth Bend he founded the Wuyi Jingshe (武夷精舍) academy, where he taught for years. His influence spread from here across China, Korea, and Japan. The inscriptions are still legible on the rock.</p>
+    <p>The Danxia (丹霞) geology — red sandstone cliffs formed from ancient seabeds lifted and tilted over millennia — is the same geology that gives Wuyi rock oolong its 岩韻 (yán yùn), rock rhyme. The river and the tea are made of the same stone.</p>
+  </div>
+</section>
+
+<!-- BENDS HEADER -->
+<div class="bends-header">
+  <div class="bends-header-left">
+    <span class="bends-label">九個彎道</span>
+    <h2 class="bends-title">The nine bends, downstream</h2>
+  </div>
+  <p class="bends-note">The raft travels from Bend 9 toward Bend 1. What follows is in order of encounter.</p>
+</div>
+
+<!-- BENDS -->
+<div class="bends">
+
+  <!-- BEND 9 -->
+  <div class="bend">
+    <div class="bend-num-col">
+      <span class="bend-num-zh">九</span>
+      <span class="bend-num-en">BEND 9</span>
+    </div>
+    <div class="bend-content">
+      <div class="bend-cliff">
+        <span class="bend-cliff-zh">星村渡口</span>
+        <div class="bend-cliff-sep"></div>
+        <span class="bend-cliff-en">Xingcun Pier — the departure point</span>
+      </div>
+      <p class="bend-body">The Ninth Bend is where the river is youngest and broadest. Tea gardens line both banks. In early morning, mist rolls off the water and hangs in the canopy. The raftsmen who push off from this pier carry knowledge passed between generations of Xingcun families — how to read the current, where the rocks sit beneath the surface, when to pole and when to let the river decide.</p>
+      <div class="bend-look"><strong>Look for:</strong> The shift from loamy riverbank to red-clay Danxia slopes on the hills above — the beginning of what makes Wuyi rock tea distinct from tea grown anywhere else.</div>
+    </div>
+  </div>
+
+  <!-- BEND 8 -->
+  <div class="bend">
+    <div class="bend-num-col">
+      <span class="bend-num-zh">八</span>
+      <span class="bend-num-en">BEND 8</span>
+    </div>
+    <div class="bend-content">
+      <div class="bend-cliff">
+        <span class="bend-cliff-zh">象鼻石 · 上水龜</span>
+        <div class="bend-cliff-sep"></div>
+        <span class="bend-cliff-en">Elephant's Trunk Rock · Water Tortoise Rock</span>
+      </div>
+      <p class="bend-body">The riverbed widens and becomes shallow — you can see the bottom. Scattered across the banks are rock formations worn by water into shapes that ask to be named. One curves like an elephant's trunk reaching for the river. Another rises from the shallows like a tortoise. The Eighth Bend is the stone menagerie of the Nine Bends.</p>
+      <div class="bend-look"><strong>Look for:</strong> River fish gathering in the shallows below the raft. It is traditional to feed them from the boat — they surface in large numbers and come close.</div>
+    </div>
+  </div>
+
+  <!-- BEND 7 -->
+  <div class="bend">
+    <div class="bend-num-col">
+      <span class="bend-num-zh">七</span>
+      <span class="bend-num-en">BEND 7</span>
+    </div>
+    <div class="bend-content">
+      <div class="bend-cliff">
+        <span class="bend-cliff-zh">三仰峰</span>
+        <div class="bend-cliff-sep"></div>
+        <span class="bend-cliff-en">Sanyang Peak — the highest in the scenic area</span>
+      </div>
+      <p class="bend-body">The channel narrows and the current quickens. This is the only bend where the river asserts itself — the single stretch of rapids on the Nine Bend journey. The raftsman at the back works with his pole, reading the water ahead, shifting his weight, placing each stroke with precision. The raft accelerates. Then, as suddenly as it began, the river releases you back into open water.</p>
+      <div class="bend-look"><strong>Look for:</strong> The boatman's technique here. The skill required to navigate these rapids — pole angled, body low, three moves ahead — is a craft that has not changed in centuries.</div>
+    </div>
+  </div>
+
+  <!-- BEND 6 -->
+  <div class="bend">
+    <div class="bend-num-col">
+      <span class="bend-num-zh">六</span>
+      <span class="bend-num-en">BEND 6</span>
+    </div>
+    <div class="bend-content">
+      <div class="bend-cliff">
+        <span class="bend-cliff-zh">天游峰 · 晒布岩</span>
+        <div class="bend-cliff-sep"></div>
+        <span class="bend-cliff-en">Tianyou Peak · Sunning Cloth Rock</span>
+      </div>
+      <p class="bend-body">The shortest bend, but the most visually dramatic. Tianyou Peak (天游峰) drops sheer to the waterline in a vast, unbroken plane of red rock — smooth and flat enough to have earned its name: Shaibuyan (晒布岩), the Sunning Cloth Rock. It looks as though the mountain cut itself clean with a blade. The river is wide enough here to take in the full height of the cliff. In late afternoon the stone glows rust and amber.</p>
+      <div class="bend-look"><strong>Look for:</strong> The reflection of Jade Maiden Peak at the Second Bend is sometimes visible from here in still water. Tianyou Peak can also be climbed — its summit gives the only aerial view of the river's full S-curve.</div>
+    </div>
+  </div>
+
+  <!-- BEND 5 -->
+  <div class="bend">
+    <div class="bend-num-col">
+      <span class="bend-num-zh">五</span>
+      <span class="bend-num-en">BEND 5</span>
+    </div>
+    <div class="bend-content">
+      <div class="bend-cliff">
+        <span class="bend-cliff-zh">隱屏峰</span>
+        <div class="bend-cliff-sep"></div>
+        <span class="bend-cliff-en">Yinping Peak — the Hidden Screen</span>
+      </div>
+      <p class="bend-body">The river opens and Yinping Peak (隱屏峰) rises at its edge like a colossal panel of rock turned toward the water. It was here, in 1183, that Zhu Xi (朱熹) built the Wuyi Jingshe (武夷精舍) — his mountain academy. He wrote, taught, and refined the Neo-Confucian philosophy that would shape intellectual culture across East Asia for centuries. The ruins of the academy still stand, accessible by a short walk from the bank.</p>
+      <div class="bend-look"><strong>Look for:</strong> Zhu Xi's calligraphy carved into the cliff face — the original Nine-Bend Boatman's Song inscription, 九曲棹歌, eight hundred years old. The characters are softened by weather but still legible in red.</div>
+    </div>
+  </div>
+
+  <!-- BEND 4 -->
+  <div class="bend">
+    <div class="bend-num-col">
+      <span class="bend-num-zh">四</span>
+      <span class="bend-num-en">BEND 4</span>
+    </div>
+    <div class="bend-content">
+      <div class="bend-cliff">
+        <span class="bend-cliff-zh">大藏峰 · 金雞洞</span>
+        <div class="bend-cliff-sep"></div>
+        <span class="bend-cliff-en">Dazang Peak · Golden Rooster Cave</span>
+      </div>
+      <p class="bend-body">The pool at the Fourth Bend runs deep — green shading toward black where it deepens. An old legend holds that a dragon sleeps in it, and that the mist rising from the surface at dawn is its breath. On the slope of Dazang Peak (大藏峰) above, the Golden Rooster Cave (金雞洞) is just visible if you look up. Near it, tucked into rock niches at impossible heights: more hanging coffins, resting in the cliff as they have for three thousand years.</p>
+      <div class="bend-look"><strong>Look for:</strong> Zhu Xi's inscription 小九曲 ("Little Nine Bends") carved at this bend. From the raft with a long lens, the characters can be brought close enough to read.</div>
+    </div>
+  </div>
+
+  <!-- BEND 3 -->
+  <div class="bend">
+    <div class="bend-num-col">
+      <span class="bend-num-zh">三</span>
+      <span class="bend-num-en">BEND 3</span>
+    </div>
+    <div class="bend-content">
+      <div class="bend-cliff">
+        <span class="bend-cliff-zh">架壑船棺崖</span>
+        <div class="bend-cliff-sep"></div>
+        <span class="bend-cliff-en">Hanging Coffin Gorge Cliff</span>
+      </div>
+      <p class="bend-body">The gorge deepens and the light changes — less sky, more cliff. The Third Bend is the heart of the hanging coffin zone. Boat-shaped wooden caskets, some weighing several hundred kilograms, were placed by an unknown civilisation into niches cut into sheer cliff faces dozens of metres above the water. Some rest in natural caves; others in carved slots. How they were raised here is a question archaeologists have not answered. Who placed them left no record of themselves. Only the coffins.</p>
+      <div class="bend-look"><strong>Look for:</strong> The layering of human time on the same stone — hanging coffins from 3,000 years ago, Song dynasty inscriptions from 800 years ago, and the names of more recent visitors, all on the same cliff face.</div>
+    </div>
+  </div>
+
+  <!-- BEND 2 -->
+  <div class="bend">
+    <div class="bend-num-col">
+      <span class="bend-num-zh">二</span>
+      <span class="bend-num-en">BEND 2</span>
+    </div>
+    <div class="bend-content">
+      <div class="bend-cliff">
+        <span class="bend-cliff-zh">玉女峰 · 大王峰</span>
+        <div class="bend-cliff-sep"></div>
+        <span class="bend-cliff-en">Jade Maiden Peak · Great King Peak</span>
+      </div>
+      <p class="bend-body">The image most associated with the Nine Bend River. Jade Maiden Peak (玉女峰) stands at the water's edge with a slender, vertical grace that has made her the river's defining silhouette for centuries. She is said to resemble a young woman gazing at her reflection. Across the water, Da Wang Peak (大王峰) — the Great King — faces her. Legend holds that she descended from heaven, and the two have faced each other across this water ever since. When the surface is still, Jade Maiden Peak reflects in the river with perfect symmetry: the mountain complete above and below.</p>
+      <div class="bend-look"><strong>Look for:</strong> The reflection on still mornings. Also: the red calligraphy marking Bend 二 on the cliff face — the second-to-last count in the river's own numbering of itself.</div>
+    </div>
+  </div>
+
+  <!-- BEND 1 -->
+  <div class="bend">
+    <div class="bend-num-col">
+      <span class="bend-num-zh">一</span>
+      <span class="bend-num-en">BEND 1</span>
+    </div>
+    <div class="bend-content">
+      <div class="bend-cliff">
+        <span class="bend-cliff-zh">大王峰 · 水光石</span>
+        <div class="bend-cliff-sep"></div>
+        <span class="bend-cliff-en">Great King Peak · Water-Glow Stone</span>
+      </div>
+      <p class="bend-body">The final bend. The river is broad here, the current slowing as though it knows the journey is ending. Da Wang Peak (大王峰) stands to the north — enormous, unhurried, watching the river pass as it has for millennia. On the Water-Glow Stone (水光石) at the bank, an inscription survives from Qi Jiguang (戚繼光), the Ming (明朝) general who fought off pirates along the Fujian coast and came to this river to rest. Wuyi Palace (武夷宫), built in the Tang dynasty (唐朝) to honour Peng Wu and Peng Yi, marks where the raft lands. The brothers who carved this river are honoured at the point where it ends.</p>
+      <div class="bend-look"><strong>Look for:</strong> The moment the mountains release you. The river opens. The palace appears. And if you have been paying attention for the past ninety minutes, you will have seen — in the cliffs, the water, the inscriptions — three thousand years of people doing the same thing.</div>
+    </div>
+  </div>
+
+</div><!-- /bends -->
+
+<!-- FOOTER -->
+<footer class="footer">
+  <p class="footer-journey">Between Leaf & Clay &nbsp;·&nbsp; Wuyishan, October 2026 &nbsp;·&nbsp; Curated by Claudia T.</p>
+  <p class="footer-r">九曲溪 · 武夷山</p>
+</footer>
+
+</body>
+</html>
