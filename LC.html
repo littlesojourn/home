@@ -1,0 +1,2058 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        // html-to-image is only used by takeScreenshot: fetched on first use, not as a
+        // parser-blocking tag. Native fetch, captured before the proxy override below.
+        const realFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
+        const HTML_TO_IMAGE_SRC = "https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js";
+        const HTML_TO_IMAGE_INTEGRITY = "sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==";
+        let htmlToImageLoad = null;
+        const loadHtmlToImage = () => {
+          if (!htmlToImageLoad) {
+            htmlToImageLoad = (realFetch
+              ? realFetch(HTML_TO_IMAGE_SRC, { integrity: HTML_TO_IMAGE_INTEGRITY, credentials: 'omit', referrerPolicy: 'no-referrer' })
+              : Promise.reject(new Error('fetch unavailable'))
+            )
+              .then((res) => {
+                if (!res.ok) throw new Error('html-to-image failed to load (' + res.status + ')');
+                return res.text();
+              })
+              .then((source) => {
+                // UMD bundle: hide the artifact's AMD/CommonJS globals so it takes the
+                // window-global branch; inline script text runs synchronously on insert.
+                const hidden = ['define', 'module', 'exports'].map((k) => {
+                  const entry = { k, own: Object.prototype.hasOwnProperty.call(window, k), v: window[k] };
+                  try { window[k] = undefined; } catch (e) {}
+                  return entry;
+                });
+                try {
+                  const el = document.createElement('script');
+                  el.text = source;
+                  (document.head || document.documentElement).appendChild(el);
+                } finally {
+                  hidden.forEach(({ k, own, v }) => {
+                    try { if (own) { window[k] = v; } else { delete window[k]; } } catch (e) {}
+                  });
+                }
+                if (!window.htmlToImage) throw new Error('html-to-image unavailable after load');
+                return window.htmlToImage;
+              });
+            // A failed load may be transient; let the next screenshot retry.
+            htmlToImageLoad.catch(() => { htmlToImageLoad = null; });
+          }
+          return htmlToImageLoad;
+        };
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            realParent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            realParent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            realParent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures and toPng errors so the parent always
+            // gets a response instead of hanging forever.
+            try {
+              const htmlToImage = await loadHtmlToImage();
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Between Leaf &amp; Clay — Participant Guide</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,500;0,600;1,300;1,400;1,600&amp;family=Plus+Jakarta+Sans:wght@300;400;500&amp;family=Noto+Serif+TC:wght@300;400&amp;display=swap" rel="stylesheet">
+<style>
+/* ════════════════════════════════════════
+   SOJOURN BRAND TOKENS
+   Source: Sojourn Brand Kit 2026
+════════════════════════════════════════ */
+:root {
+  --xz:   #EDE5D8;   /* 宣紙  Xuan Paper  — primary background */
+  --mo:   #1E1B16;   /* 墨    Ink         — primary text */
+  --ch:   #8B6344;   /* 茶褐  Tea Brown   — primary accent */
+  --cht:  #6A4628;   /* 茶褐  Tea Brown dark */
+  --q:    #568A86;   /* 青    Jade Teal   — secondary accent */
+  --qt:   #38696A;   /* 青    Jade Teal dark — section labels */
+  --ma:   #A89070;   /* 麻    Hemp        — warm neutral */
+  --sg:   #8A8478;   /* 鼠灰  Mouse Grey  — muted neutral */
+  --nb:   #E4D8C4;   /* 奶    Warm white  — card ground */
+  --serif: "Cormorant Garamond", serif;
+  --sans:  "Plus Jakarta Sans", sans-serif;
+  --tc:    "Noto Serif TC", "Source Han Serif TC", serif;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { -webkit-font-smoothing: antialiased; }
+
+body {
+  background: var(--xz);
+  color: var(--mo);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.9;
+  font-weight: 300;
+}
+
+/* ── NAV ── */
+nav {
+  position: fixed;
+  top: 0; left: 0; right: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 1rem 3rem;
+  transition: background 0.3s, border-color 0.3s;
+  background: rgba(237,229,216,0.92);
+  border-bottom: 1px solid rgba(139,99,68,.18);
+  backdrop-filter: blur(10px);
+}
+.nav-brand {
+  font-family: var(--serif);
+  font-size: 15px;
+  font-weight: 400;
+  color: var(--mo);
+  text-decoration: none;
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+}
+.nav-links { display: flex; gap: 1.6rem; list-style: none; }
+.nav-links a {
+  font-family: var(--sans);
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--sg);
+  text-decoration: none;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  transition: color 0.2s;
+  white-space: nowrap;
+}
+.nav-links a:hover { color: var(--q); }
+
+/* ── HERO ── */
+#landing {
+  min-height: 100vh;
+  background: var(--xz);
+  position: relative;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.hero-bg {
+  position: absolute; inset: 0;
+  background:
+    radial-gradient(ellipse 60% 50% at 5% 95%, rgba(139,99,68,0.1) 0%, transparent 55%),
+    radial-gradient(ellipse 40% 40% at 90% 10%, rgba(86,138,134,0.06) 0%, transparent 55%);
+}
+.hero-body {
+  position: relative; z-index: 2;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  padding: 9rem 5vw 5vw;
+}
+.hero-zh {
+  font-family: var(--tc);
+  font-weight: 300;
+  font-size: 12px;
+  color: rgba(139,99,68,0.45);
+  letter-spacing: 0.22em;
+  margin-bottom: 1.2rem;
+}
+.hero-title {
+  font-family: var(--serif);
+  font-size: clamp(52px, 10.5vw, 140px);
+  font-weight: 300;
+  line-height: 0.92;
+  color: var(--mo);
+  letter-spacing: -0.022em;
+  margin-bottom: 3rem;
+}
+.hero-title em { font-style: italic; color: var(--ch); }
+.hero-facts {
+  display: flex;
+  gap: 3.5rem;
+  flex-wrap: wrap;
+  border-top: 1px solid rgba(139,99,68,.18);
+  padding-top: 1.6rem;
+}
+.hf { display: flex; flex-direction: column; gap: 0.2rem; }
+.hf-label {
+  font-family: var(--tc);
+  font-size: 10px;
+  color: var(--ma);
+  letter-spacing: 0.2em;
+  font-weight: 300;
+}
+.hf-value {
+  font-family: var(--sans);
+  font-size: 13px;
+  color: var(--mo);
+  font-weight: 300;
+}
+
+/* ── SHARED TOKENS ── */
+.s-zh {
+  font-family: var(--tc);
+  font-size: 12px;
+  letter-spacing: 0.2em;
+  font-weight: 300;
+  color: var(--qt);
+  margin-bottom: 1rem;
+  display: block;
+}
+.s-title {
+  font-family: var(--serif);
+  font-weight: 300;
+  font-size: clamp(28px, 3.8vw, 46px);
+  line-height: 1.1;
+  letter-spacing: -0.015em;
+  margin-bottom: 2.8rem;
+}
+.prose {
+  font-size: 14px;
+  line-height: 1.9;
+  color: #52483E;
+  max-width: 60ch;
+}
+.prose p { margin-bottom: 1.2rem; }
+.prose p:last-child { margin: 0; }
+
+/* ── INTRO ── */
+.intro-section {
+  background: var(--xz);
+  padding: 7vw 5vw;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 7vw;
+  align-items: start;
+  border-top: 1px solid rgba(139,99,68,.18);
+}
+.intro-right { padding-top: 4.5rem; }
+.intro-quote {
+  font-family: var(--serif);
+  font-size: clamp(19px, 2.6vw, 28px);
+  font-weight: 300;
+  font-style: italic;
+  color: var(--ch);
+  border-left: 1px solid rgba(139,99,68,.35);
+  padding-left: 1.6rem;
+  line-height: 1.45;
+  margin-bottom: 2rem;
+}
+
+/* ── DESTINATIONS ── */
+.destinations {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  border-top: 1px solid rgba(139,99,68,.18);
+}
+.dest { padding: 6vw 5vw; }
+.dest-wuyi { background: var(--nb); }
+.dest-jdz  { background: var(--xz); border-left: 1px solid rgba(139,99,68,.14); }
+.dest-zh {
+  font-family: var(--tc);
+  font-size: 10px;
+  letter-spacing: 0.2em;
+  margin-bottom: 0.7rem;
+  display: block;
+  font-weight: 300;
+}
+.dest-wuyi .dest-zh { color: var(--ch); }
+.dest-jdz  .dest-zh { color: var(--qt); }
+.dest-title {
+  font-family: var(--serif);
+  font-size: clamp(24px, 3vw, 38px);
+  font-weight: 300;
+  letter-spacing: -0.015em;
+  line-height: 1.1;
+  margin-bottom: 1.4rem;
+}
+.dest-body { font-size: 13.5px; line-height: 1.9; color: #52483E; max-width: 50ch; }
+.dest-body p { margin-bottom: 1rem; }
+.dest-facts { margin-top: 1.8rem; }
+.dest-fact {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  padding: 0.6rem 0;
+  font-size: 12.5px;
+  gap: 1rem;
+  border-bottom: 1px solid rgba(139,99,68,.12);
+}
+.dest-fact:last-child { border-bottom: none; }
+.dest-fact-l { color: var(--sg); }
+.dest-fact-r { color: var(--mo); text-align: right; }
+
+/* ── OVERVIEW ── */
+#overview {
+  background: var(--nb);
+  padding: 0;
+  border-top: 1px solid rgba(139,99,68,.18);
+  border-bottom: 1px solid rgba(139,99,68,.18);
+}
+.overview-grid {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  max-width: 1100px;
+  margin: 0 auto;
+}
+.ov-cell {
+  padding: 1.6rem 1.8rem;
+  border-right: 1px solid rgba(139,99,68,.12);
+}
+.ov-cell:last-child { border-right: none; }
+.ov-label {
+  font-family: var(--tc);
+  font-size: 10px;
+  letter-spacing: 0.2em;
+  color: var(--sg);
+  font-weight: 300;
+  margin-bottom: 0.4rem;
+}
+.ov-value {
+  font-family: var(--serif);
+  font-size: 17px;
+  font-weight: 300;
+  color: var(--mo);
+  line-height: 1.3;
+}
+
+/* ── ITINERARY ── */
+#itin {
+  background: var(--xz);
+  padding: 8vw 6vw;
+  border-top: 1px solid rgba(139,99,68,.18);
+}
+#itin .s-title { color: var(--mo); }
+.itin-note {
+  font-size: 13px;
+  color: var(--sg);
+  font-style: italic;
+  max-width: 52ch;
+  margin-bottom: 3.5rem;
+  line-height: 1.9;
+}
+.chapter-head {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  margin: 3rem 0 1.5rem;
+}
+.chapter-head::after { content: ''; flex: 1; height: 1px; }
+.ch-wuyi .chapter-head::after   { background: rgba(139,99,68,.2); }
+.ch-travel .chapter-head::after { background: rgba(138,132,120,.14); }
+.ch-jdz .chapter-head::after    { background: rgba(86,138,134,.2); }
+.chapter-head h3 {
+  font-family: var(--tc);
+  font-size: 11px;
+  font-weight: 300;
+  letter-spacing: 0.2em;
+  white-space: nowrap;
+}
+.ch-wuyi .chapter-head h3   { color: var(--ch); opacity: 0.55; }
+.ch-travel .chapter-head h3 { color: var(--sg); opacity: 0.6; }
+.ch-jdz .chapter-head h3    { color: var(--q); opacity: 0.6; }
+
+.day-card {
+  display: grid;
+  grid-template-columns: 150px 1fr;
+  margin-bottom: 1px;
+  border: 1px solid rgba(139,99,68,.12);
+  border-bottom: none;
+}
+.day-card:last-child { border-bottom: 1px solid rgba(139,99,68,.12); }
+.day-side {
+  background: var(--nb);
+  padding: 1.8rem 1.4rem;
+  border-right: 1px solid rgba(139,99,68,.12);
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+.day-body {
+  background: var(--xz);
+  padding: 1.8rem 2rem;
+}
+.day-num {
+  font-family: var(--serif);
+  font-size: 38px;
+  font-weight: 300;
+  line-height: 1;
+}
+.ch-wuyi .day-num   { color: rgba(139,99,68,.35); }
+.ch-jdz .day-num    { color: rgba(86,138,134,.3); }
+.ch-travel .day-num { color: rgba(138,132,120,.3); }
+.day-date {
+  font-family: var(--sans);
+  font-size: 11px;
+  color: var(--sg);
+  line-height: 1.4;
+  font-weight: 300;
+}
+.day-title-row {
+  display: flex;
+  align-items: baseline;
+  gap: 1rem;
+  margin-bottom: 1.4rem;
+  flex-wrap: wrap;
+}
+.day-title {
+  font-family: var(--serif);
+  font-size: 20px;
+  font-weight: 400;
+  color: var(--mo);
+  letter-spacing: -0.01em;
+}
+.day-note {
+  font-family: var(--tc);
+  font-size: 10.5px;
+  color: var(--sg);
+  letter-spacing: 0.06em;
+}
+.sched { display: flex; flex-direction: column; }
+.srow {
+  display: grid;
+  grid-template-columns: 60px 1fr;
+  gap: 1rem;
+  padding: 0.6rem 0;
+  border-bottom: 1px solid rgba(139,99,68,.1);
+  align-items: baseline;
+}
+.srow:last-child { border-bottom: none; }
+.stime {
+  font-family: var(--sans);
+  font-size: 11px;
+  color: var(--ma);
+  letter-spacing: 0.04em;
+  font-weight: 300;
+}
+.sevent {
+  font-size: 13px;
+  color: #52483E;
+  line-height: 1.75;
+}
+.sevent strong { color: var(--mo); font-weight: 400; }
+.sevent em { font-style: italic; color: var(--sg); }
+.day-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-top: 1.1rem;
+}
+.tag {
+  font-family: var(--sans);
+  font-size: 10.5px;
+  padding: 0.2rem 0.65rem;
+  border: 1px solid;
+  letter-spacing: 0.04em;
+  font-weight: 400;
+}
+.tag-meal      { border-color: rgba(139,99,68,.28); color: rgba(139,99,68,.7); }
+.tag-transport { border-color: rgba(86,138,134,.28); color: rgba(86,138,134,.75); }
+.tag-bring     { border-color: rgba(138,132,120,.25); color: var(--sg); }
+.tag-free      { border-color: rgba(138,132,120,.2); color: rgba(138,132,120,.6); }
+
+.travel-bridge {
+  background: var(--nb);
+  display: grid;
+  grid-template-columns: 150px 1fr;
+  margin-bottom: 1px;
+  border: 1px solid rgba(139,99,68,.12);
+  border-bottom: none;
+}
+.travel-bridge-side {
+  padding: 1.5rem 1.4rem;
+  border-right: 1px solid rgba(139,99,68,.1);
+}
+.travel-bridge-label {
+  font-family: var(--serif);
+  font-size: 14px;
+  font-style: italic;
+  color: var(--sg);
+  line-height: 1.4;
+}
+.travel-bridge-body {
+  padding: 1.5rem 2rem;
+  font-size: 13px;
+  color: #52483E;
+  line-height: 1.8;
+}
+.travel-bridge-body strong { color: var(--mo); font-weight: 400; }
+
+/* ── PARTICIPANTS ── */
+#participants {
+  background: var(--nb);
+  padding: 8vw 6vw;
+  border-top: 1px solid rgba(139,99,68,.18);
+}
+.participants-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 1px;
+  background: rgba(139,99,68,.14);
+  margin-top: 2rem;
+}
+.participant {
+  background: var(--nb);
+  padding: 1.8rem 1.6rem;
+}
+.p-name {
+  font-family: var(--serif);
+  font-size: 21px;
+  font-weight: 400;
+  letter-spacing: -0.01em;
+  line-height: 1.1;
+  margin-bottom: 0.2rem;
+}
+.p-handle {
+  font-family: var(--sans);
+  font-size: 11.5px;
+  color: var(--ch);
+  font-weight: 300;
+  margin-bottom: 1rem;
+  display: block;
+}
+.p-div { width: 20px; height: 1px; background: rgba(139,99,68,.2); margin-bottom: 1rem; }
+.p-bio { font-size: 13px; line-height: 1.85; color: #52483E; }
+
+/* ── BEFORE YOU GO ── */
+#before {
+  background: var(--xz);
+  padding: 8vw 6vw;
+  border-top: 1px solid rgba(139,99,68,.18);
+}
+.priority-box {
+  background: rgba(86,138,134,.07);
+  border-left: 2px solid var(--q);
+  padding: 1.5rem 1.8rem;
+  margin: 1.5rem 0 2.5rem;
+  display: flex;
+  gap: 1.2rem;
+  align-items: flex-start;
+  max-width: 1100px;
+}
+.priority-box-mark {
+  font-family: var(--serif);
+  font-size: 22px;
+  font-weight: 300;
+  color: var(--q);
+  flex-shrink: 0;
+  line-height: 1;
+  margin-top: 2px;
+}
+.priority-box strong {
+  font-family: var(--serif);
+  font-size: 18px;
+  font-weight: 400;
+  color: var(--mo);
+  display: block;
+  margin-bottom: 0.4rem;
+}
+.priority-box p {
+  font-size: 13.5px;
+  color: #52483E;
+  line-height: 1.85;
+  margin: 0 0 0.35rem;
+}
+.priority-box p:last-child { margin: 0; }
+.know-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1px;
+  background: rgba(139,99,68,.14);
+  max-width: 1100px;
+}
+.know-block {
+  background: var(--xz);
+  padding: 2rem 1.8rem;
+}
+.know-block h3 {
+  font-family: var(--serif);
+  font-size: 19px;
+  font-weight: 400;
+  letter-spacing: -0.01em;
+  margin-bottom: 1rem;
+  color: var(--mo);
+}
+.know-block ul { list-style: none; padding: 0; }
+.know-block ul li {
+  font-size: 13px;
+  color: #52483E;
+  line-height: 1.75;
+  padding: 0.5rem 0;
+  border-bottom: 1px solid rgba(139,99,68,.1);
+  display: flex;
+  gap: 0.8rem;
+  align-items: flex-start;
+}
+.know-block ul li:last-child { border-bottom: none; }
+.know-block ul li::before { content: '—'; color: var(--ma); flex-shrink: 0; }
+.know-block ul li strong { font-weight: 400; color: var(--mo); }
+.note-box {
+  background: rgba(86,138,134,.06);
+  border-left: 2px solid var(--q);
+  padding: 0.9rem 1.1rem;
+  margin-top: 1rem;
+  font-size: 12.5px;
+  color: #52483E;
+  line-height: 1.75;
+  font-style: italic;
+}
+.warn-box {
+  background: rgba(139,99,68,.05);
+  border-left: 2px solid var(--ch);
+  padding: 0.9rem 1.1rem;
+  margin-top: 1rem;
+  font-size: 12.5px;
+  color: #52483E;
+  line-height: 1.75;
+  font-style: italic;
+}
+
+/* ── GETTING THERE ── */
+#getting-there {
+  background: var(--nb);
+  padding: 8vw 6vw;
+  border-top: 1px solid rgba(139,99,68,.18);
+}
+.getting-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4vw;
+  margin-top: 2rem;
+  max-width: 1100px;
+}
+.getting-block { margin-bottom: 2.5rem; }
+.getting-block h3 {
+  font-family: var(--serif);
+  font-size: 19px;
+  font-weight: 400;
+  letter-spacing: -0.01em;
+  margin-bottom: 1rem;
+}
+.getting-block p {
+  font-size: 13.5px;
+  color: #52483E;
+  line-height: 1.85;
+  margin-bottom: 0.8rem;
+}
+.getting-block ul { list-style: none; padding: 0; }
+.getting-block ul li {
+  font-size: 13px;
+  color: #52483E;
+  line-height: 1.75;
+  padding: 0.55rem 0;
+  border-bottom: 1px solid rgba(139,99,68,.1);
+  display: flex;
+  gap: 0.8rem;
+}
+.getting-block ul li:last-child { border-bottom: none; }
+.getting-block ul li::before { content: '—'; color: var(--ma); flex-shrink: 0; }
+.getting-block ul li strong { font-weight: 400; color: var(--mo); }
+.routes-table { width: 100%; border-collapse: collapse; margin-top: 0.5rem; }
+.routes-table th {
+  font-family: var(--tc);
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  font-weight: 300;
+  color: var(--sg);
+  text-align: left;
+  padding: 0.5rem 0.8rem 0.5rem 0;
+  border-bottom: 1px solid rgba(139,99,68,.18);
+}
+.routes-table td {
+  font-size: 13px;
+  color: #52483E;
+  padding: 0.6rem 0.8rem 0.6rem 0;
+  border-bottom: 1px solid rgba(139,99,68,.1);
+  vertical-align: top;
+  line-height: 1.5;
+}
+.routes-table tr:last-child td { border-bottom: none; }
+.action-box {
+  background: var(--nb);
+  border: 1px solid rgba(139,99,68,.18);
+  padding: 1.5rem 1.8rem;
+  margin-top: 1rem;
+}
+.action-box p {
+  font-size: 13.5px;
+  color: #52483E;
+  line-height: 1.75;
+  margin: 0;
+}
+.action-box strong { color: var(--mo); font-weight: 400; }
+
+/* ── QUICK REF ── */
+#quick-ref {
+  background: var(--nb);
+  padding: 8vw 6vw;
+  border-top: 1px solid rgba(139,99,68,.18);
+}
+.qr-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1px;
+  background: rgba(139,99,68,.14);
+  margin-top: 2rem;
+  max-width: 1100px;
+}
+.qr-block {
+  background: var(--nb);
+  padding: 1.8rem 1.6rem;
+}
+.qr-block h3 {
+  font-family: var(--serif);
+  font-size: 17px;
+  font-weight: 400;
+  color: var(--mo);
+  letter-spacing: -0.01em;
+  margin-bottom: 1rem;
+}
+.qr-row-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  padding: 0.55rem 0;
+  border-bottom: 1px solid rgba(139,99,68,.1);
+  gap: 1rem;
+}
+.qr-row-item:last-child { border-bottom: none; }
+.qr-label { font-size: 12px; color: var(--sg); }
+.qr-val { font-size: 13px; color: #52483E; text-align: right; }
+.qr-val a { color: var(--q); text-decoration: none; }
+.qr-tbc { color: var(--ma); font-style: italic; }
+.emergency-list { list-style: none; padding: 0; }
+.emergency-list li {
+  display: flex;
+  justify-content: space-between;
+  padding: 0.55rem 0;
+  border-bottom: 1px solid rgba(139,99,68,.1);
+  font-size: 13px;
+}
+.emergency-list li:last-child { border-bottom: none; }
+.em-label { color: var(--sg); }
+.em-num { color: #52483E; letter-spacing: 0.06em; }
+.deadline-box {
+  background: rgba(139,99,68,.06);
+  border: 1px solid rgba(139,99,68,.18);
+  padding: 1.2rem 1.5rem;
+  margin-top: 2rem;
+  max-width: 1100px;
+}
+.deadline-box p {
+  font-size: 13.5px;
+  color: #52483E;
+  line-height: 1.75;
+  margin: 0;
+}
+.deadline-box strong { color: var(--mo); font-weight: 400; }
+
+/* ── FOOTER ── */
+footer {
+  background: var(--nb);
+  padding: 2rem 5vw;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1.5rem;
+  flex-wrap: wrap;
+  border-top: 1px solid rgba(139,99,68,.18);
+}
+.footer-l {
+  font-family: var(--serif);
+  font-size: 13px;
+  font-weight: 300;
+  color: var(--sg);
+}
+.footer-r {
+  font-family: var(--tc);
+  font-size: 10px;
+  color: var(--ma);
+  letter-spacing: 0.14em;
+  font-weight: 300;
+}
+
+/* ════════════════════════════════════════
+   EDIT MODE
+════════════════════════════════════════ */
+.edit-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-shrink: 0;
+}
+.edit-btn {
+  font-family: var(--sans);
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  padding: 0.3rem 0.85rem;
+  border: 1px solid rgba(138,132,120,.35);
+  background: transparent;
+  color: var(--sg);
+  cursor: pointer;
+  transition: all 0.2s;
+  line-height: 1;
+}
+.edit-btn:hover, body.edit-mode .edit-btn {
+  background: var(--q);
+  border-color: var(--q);
+  color: var(--xz);
+}
+.download-btn {
+  display: none;
+  font-family: var(--sans);
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  padding: 0.3rem 0.85rem;
+  border: 1px solid rgba(139,99,68,.35);
+  background: transparent;
+  color: var(--ch);
+  cursor: pointer;
+  transition: all 0.2s;
+  line-height: 1;
+}
+.download-btn:hover { background: var(--ch); border-color: var(--ch); color: var(--xz); }
+body.edit-mode .download-btn { display: block; }
+body.edit-mode [contenteditable="true"] {
+  outline: 1px dashed rgba(86,138,134,.35);
+  outline-offset: 1px;
+  cursor: text;
+}
+body.edit-mode [contenteditable="true"]:hover { background: rgba(86,138,134,.04); outline-color: rgba(86,138,134,.6); }
+body.edit-mode [contenteditable="true"]:focus { outline: 1.5px solid var(--q); outline-offset: 2px; background: rgba(86,138,134,.06); }
+.deletable { position: relative; }
+.del-btn {
+  display: none;
+  position: absolute;
+  top: 6px; right: 6px;
+  width: 22px; height: 22px;
+  background: rgba(180,50,50,.8);
+  color: #fff;
+  border: none;
+  border-radius: 50%;
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  align-items: center;
+  justify-content: center;
+  z-index: 200;
+  transition: opacity 0.15s;
+  font-family: sans-serif;
+  padding: 0;
+  opacity: 0;
+}
+body.edit-mode .del-btn { display: flex; }
+body.edit-mode .deletable:hover > .del-btn { opacity: 1; }
+.del-btn:hover { background: rgba(200,40,40,1) !important; opacity: 1 !important; }
+body.edit-mode .deletable:hover { box-shadow: inset 0 0 0 1.5px rgba(180,50,50,.12); }
+.edit-notice {
+  position: fixed;
+  bottom: 0; left: 0; right: 0;
+  z-index: 300;
+  background: var(--xz);
+  border-top: 1px solid rgba(139,99,68,.2);
+  padding: 0.65rem 2rem;
+  font-family: var(--sans);
+  font-size: 11.5px;
+  color: var(--sg);
+  letter-spacing: 0.04em;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  transform: translateY(100%);
+  transition: transform 0.25s ease;
+}
+body.edit-mode .edit-notice { transform: translateY(0); }
+.edit-notice span { color: var(--q); }
+
+/* ── RESPONSIVE ── */
+@media (max-width: 1024px) {
+  .participants-grid { grid-template-columns: repeat(2, 1fr); }
+  .qr-grid { grid-template-columns: repeat(2, 1fr); }
+}
+@media (max-width: 900px) {
+  nav { padding: 0.9rem 1.5rem; }
+  .nav-links { gap: 1rem; }
+  .nav-links a { font-size: 10px; }
+  .intro-section { grid-template-columns: 1fr; gap: 3rem; }
+  .intro-right { padding-top: 0; }
+  .destinations { grid-template-columns: 1fr; }
+  .know-grid { grid-template-columns: 1fr; }
+  .getting-grid { grid-template-columns: 1fr; }
+  .day-card { grid-template-columns: 1fr; }
+  .day-side { border-right: none; border-bottom: 1px solid rgba(139,99,68,.12); flex-direction: row; align-items: baseline; gap: 1rem; }
+  .travel-bridge { grid-template-columns: 1fr; }
+  .travel-bridge-side { border-right: none; border-bottom: 1px solid rgba(139,99,68,.1); }
+  .travel-bridge-body { padding-left: 1.5rem; }
+}
+@media (max-width: 600px) {
+  nav { padding: 0.8rem 1.2rem; }
+  .nav-links { display: none; }
+  .participants-grid { grid-template-columns: 1fr; }
+  .qr-grid { grid-template-columns: 1fr; }
+  .hero-facts { gap: 2rem; }
+  .priority-box { flex-direction: column; gap: 0.5rem; }
+}
+
+</style>
+</head>
+<body id="artifacts-component-root-html" class="">
+
+<!-- NAV -->
+<nav id="main-nav" class="scrolled">
+  <a href="#landing" class="nav-brand">Between Leaf &amp; Clay</a>
+  <ul class="nav-links">
+    <li><a href="#itin">Itinerary</a></li>
+    <li><a href="#participants">Participants</a></li>
+    <li><a href="#before">Things to Know</a></li>
+    <li><a href="#quick-ref">Quick Reference</a></li>
+  </ul>
+  
+</nav>
+
+<!-- ════════════════════════════════════════
+     LANDING
+════════════════════════════════════════ -->
+<div id="landing">
+
+  <!-- Hero -->
+  <div style="background:var(--xz);position:relative;overflow:hidden;">
+    <div class="hero-bg"></div>
+    <div class="hero-body">
+      <p class="hero-zh" contenteditable="false" spellcheck="false">茶器之間</p>
+      <h1 class="hero-title" contenteditable="false" spellcheck="false">Between<br>Leaf<em>&amp;</em>Clay</h1>
+      <div class="hero-facts">
+        <div class="hf">
+          <span class="hf-label" contenteditable="false" spellcheck="false">Dates</span>
+          <span class="hf-value" contenteditable="false" spellcheck="false">October 24 — November 1, 2026</span>
+        </div>
+        <div class="hf">
+          <span class="hf-label" contenteditable="false" spellcheck="false">Duration</span>
+          <span class="hf-value" contenteditable="false" spellcheck="false">9 days · 8 nights</span>
+        </div>
+        <div class="hf">
+          <span class="hf-label" contenteditable="false" spellcheck="false">Destinations</span>
+          <span class="hf-value" contenteditable="false" spellcheck="false">Wuyishan · Jingdezhen</span>
+        </div>
+        <div class="hf">
+          <span class="hf-label" contenteditable="false" spellcheck="false">Curator</span>
+          <span class="hf-value" contenteditable="false" spellcheck="false">Claudia</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- About the journey -->
+  <div class="intro-section">
+    <div class="intro-left">
+      <span class="s-zh" style="color:var(--qt)" contenteditable="false" spellcheck="false">关于此行</span>
+      <h2 class="s-title" contenteditable="false" spellcheck="false">A journey to where tea and clay begin</h2>
+      <div class="prose">
+        <p contenteditable="false" spellcheck="false">Every cup of tea tells two stories: where it was grown, and what it was made in. This journey follows both to their source.</p>
+        <p contenteditable="false" spellcheck="false">We travel first to Wuyishan (武夷山) in Fujian, the cradle of rock oolong, where tea grows in the crevices of Danxia (丹霞) cliffs and the culture of tea has accumulated over a thousand years. Then we move to Jingdezhen (景德镇) in Jiangxi, the porcelain capital of the world for seventeen centuries, where kilns still fire and artists still make.</p>
+      </div>
+    </div>
+    <div class="intro-right">
+      <p class="intro-quote" contenteditable="false" spellcheck="false">"The pot remembers the hands that made it. The tea remembers the mountain."</p>
+      <div class="prose">
+        <p contenteditable="false" spellcheck="false">We move between cities by high-speed rail, a four-hour arc from one province to the next, from mountain to plain, from leaf to clay. The shift in landscape, light, and material culture is palpable.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Destinations -->
+  <div class="destinations">
+    <div class="dest dest-wuyi">
+      <span class="dest-zh" contenteditable="false" spellcheck="false">武夷山 · Fujian (福建)</span>
+      <h2 class="dest-title" contenteditable="false" spellcheck="false">Wuyishan</h2>
+      <div class="dest-body">
+        <p contenteditable="false" spellcheck="false">A UNESCO World Cultural and Natural Heritage Site. The Danxia (丹霞) landscape, with red sandstone cliffs carved by the Nine Bend River (九曲溪), is the same geology that gives Wuyi rock oolong its mineral character, 岩韵 (yán yùn). The mountains also carry a thousand years of influences from the three teachings, Confucianism, Buddhism, and Taoism, a coexistence that gave Wuyishan much of its singular depth.</p>
+      </div>
+      <div class="dest-facts">
+        <div class="dest-fact"><span class="dest-fact-l">Province</span><span class="dest-fact-r">Fujian (福建)</span></div>
+        <div class="dest-fact"><span class="dest-fact-l">October weather</span><span class="dest-fact-r">13–22°C / 55–72°F</span></div>
+        <div class="dest-fact"><span class="dest-fact-l">Days on trip</span><span class="dest-fact-r">Oct 24–28 (4.5 days)</span></div>
+      </div>
+    </div>
+    <div class="dest dest-jdz">
+      <span class="dest-zh" contenteditable="false" spellcheck="false">景德镇 · Jiangxi (江西)</span>
+      <h2 class="dest-title" contenteditable="false" spellcheck="false">Jingdezhen</h2>
+      <div class="dest-body">
+        <p contenteditable="false" spellcheck="false">China's porcelain capital for seventeen centuries. Jingdezhen's kilns supplied the imperial court from the Song (宋) dynasty onward, and its output shaped ceramic traditions from Korea to Persia to Delft. The geological reason: fine deposits of kaolin and petuntse beneath the city, in combination, found almost nowhere else.</p>
+      </div>
+      <div class="dest-facts">
+        <div class="dest-fact"><span class="dest-fact-l">Province</span><span class="dest-fact-r">Jiangxi (江西)</span></div>
+        <div class="dest-fact"><span class="dest-fact-l">October weather</span><span class="dest-fact-r">10–25°C / 50–77°F, dropping end of Oct</span></div>
+        <div class="dest-fact"><span class="dest-fact-l">Days on trip</span><span class="dest-fact-r">Oct 28–Nov 1 (4.5 days)</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Local hosts -->
+  <!--deleted-->
+
+</div><!-- /landing -->
+
+<!-- ════════════════════════════════════════
+     ITINERARY
+════════════════════════════════════════ -->
+<section id="itin" class="">
+  <div class="section-inner">
+    <span class="s-zh" contenteditable="false" spellcheck="false">日程安排</span>
+    <h2 class="s-title" contenteditable="false" spellcheck="false">Itinerary</h2>
+    
+
+    <!-- ── WUYISHAN ── -->
+    <div class="ch-wuyi">
+      <div class="chapter-head"><h3 contenteditable="false" spellcheck="false">Wuyishan, Fujian (武夷山) · Days 1–4 · Oct 24–27</h3></div>
+
+      <!-- DAY 1 -->
+      <div class="day-card">
+        <div class="day-side">
+          <div class="day-num" style="color:rgba(139,99,68,0.5)">1</div>
+          <div class="day-date" contenteditable="false" spellcheck="false">Saturday<br>Oct 24</div>
+        </div>
+        <div class="day-body">
+          <div class="day-title-row">
+            <h3 class="day-title" contenteditable="false" spellcheck="false">Arrival &amp; Welcome</h3>
+          </div>
+          <div class="sched">
+            <div class="srow"><span class="stime" contenteditable="false" spellcheck="false">14:00+</span><span class="sevent" contenteditable="false" spellcheck="false">Claudia arranges <strong>pickup from Wuyishan North Station (武夷山北站)</strong>&nbsp;</span></div>
+            <div class="srow"><span class="stime" contenteditable="false" spellcheck="false">18:00</span><span class="sevent" contenteditable="false" spellcheck="false"><strong>Welcome dinner</strong> — the group gathers for the first time</span></div>
+            <div class="srow"><span class="stime" contenteditable="false" spellcheck="false">20:00</span><span class="sevent" contenteditable="false" spellcheck="false"><strong>Post-dinner tea gathering</strong> — first tea gathering to kick off the trip</span></div>
+          </div>
+          <div class="day-tags">
+            </div>
+        </div>
+      </div>
+
+      <!-- DAY 2 -->
+      <div class="day-card">
+        <div class="day-side">
+          <div class="day-num" style="color:rgba(139,99,68,0.5)">2</div>
+          <div class="day-date" contenteditable="false" spellcheck="false">Sunday<br>Oct 25</div>
+        </div>
+        <div class="day-body">
+          <div class="day-title-row">
+            <h3 class="day-title" contenteditable="false" spellcheck="false">Tea Mountains &amp; Living Craft</h3>
+          </div>
+          <div class="sched">
+            <div class="srow">
+              <span class="stime" contenteditable="false" spellcheck="false">AM</span>
+              <span class="sevent" contenteditable="false" spellcheck="false">
+                <strong>ICH tea master explains tea-making</strong> — 非遺茶人講解製茶<br>
+                At Xi Gua, one of the biggest tea corp in Wuyishan, master of Intangible Cultural Heritage tea craft&nbsp; walks through the processes behind Wuyi rock oolong, picking, withering, rolling, oxidation, and the critical roasting that shapes its character<br><br>
+                <strong>Tea garden visit and tea-making experience</strong> — 參觀茶園與做茶體驗<br>
+                Into the gardens: hands on the leaves, understanding what grows here and why this ground produces what it does
+              </span>
+            </div>
+            <div class="srow">
+              <span class="stime" contenteditable="false" spellcheck="false">PM</span>
+              <span class="sevent" contenteditable="false" spellcheck="false"><strong>Survey of the named rock sites</strong> — 實地考察<br>
+                Walk through the most famous rock oolong terrain in the world:<br>
+                牛欄坑 Niulanken · 北斗峰 Beidou Peak · 天心岩 Tianxin Rock · 金交椅 Jinjiao Yi · 鬼洞 Ghost Cave&nbsp;&nbsp;· 天心寺泡茶 Tianxin Temple<br><br><span style="color: rgb(184, 176, 160);">Tea garden and handmade tea workshop visit</span> — 參觀茶園手工茶坊<br>A great comparison</span>
+            </div>
+          </div>
+          <div class="day-tags">
+            </div>
+        </div>
+      </div>
+
+      <!-- DAY 3 -->
+      <div class="day-card">
+        <div class="day-side">
+          <div class="day-num" style="color:rgba(139,99,68,0.5)">3</div>
+          <div class="day-date" contenteditable="false" spellcheck="false">Monday<br>Oct 26</div>
+        </div>
+        <div class="day-body">
+          <div class="day-title-row">
+            <h3 class="day-title" contenteditable="false" spellcheck="false">The Nine Bend River &amp; Mother Trees</h3>
+          </div>
+          <div class="sched">
+            <div class="srow">
+              <span class="stime" contenteditable="false" spellcheck="false">AM</span>
+              <span class="sevent" contenteditable="false" spellcheck="false">
+                <strong>Nine Bend River bamboo raft</strong> — 九曲溪竹筏<br>
+                Early departure from Xingcun (星村) pier. Two hours drifting the nine bends downstream — past 3,000-year-old hanging coffins, Song dynasty cliff inscriptions, and Jade Maiden Peak (玉女峰) reflected in still water. Each bend marked in red calligraphy on the rock face, counting down: 九 to 一
+              </span>
+            </div>
+            <div class="srow">
+              <span class="stime" contenteditable="false" spellcheck="false">PM</span>
+              <span class="sevent" contenteditable="false" spellcheck="false">
+                <strong>Jiulong Ke mother tree Da Hong Pao</strong> — 九龍窠母樹大紅袍<br>
+                The original six Da Hong Pao bushes — the most famous tea plants on earth, now no longer harvested but still growing on the cliffside at Jiulong Ke (九龍窠)<br><br>
+                <strong>Rock Bone &amp; Floral Fragrance Trail</strong> — 岩骨花香游道<br>
+                Walking the trail through the concentrated production landscape, visiting:<br>
+                流香澗 Liuxiang Stream · 慧苑坑 Huiyuan Pit · 古井 the Ancient Well · 慧苑寺 Huiyuan Temple<br></span>
+            </div>
+            <div class="srow"><span class="stime" contenteditable="false" spellcheck="false"><br></span><span class="sevent" contenteditable="false" spellcheck="false"><strong>Jian Dong Keng Ke Tea Gathering</strong> — 澗洞坑窠茶會&nbsp;<br>An epic cliff tea gathering to taste tea from the very site visited</span></div>
+          </div>
+          <div class="day-tags">
+            </div>
+        </div>
+      </div>
+
+      <!-- DAY 4 -->
+      <div class="day-card">
+        <div class="day-side">
+          <div class="day-num" style="color:rgba(139,99,68,0.5)">4</div>
+          <div class="day-date" contenteditable="false" spellcheck="false">Tuesday<br>Oct 27</div>
+        </div>
+        <div class="day-body">
+          <div class="day-title-row">
+            <h3 class="day-title" contenteditable="false" spellcheck="false">Tongmu Pass — Where Black Tea Began</h3>
+          </div>
+          <div class="sched">
+            <div class="srow">
+              <span class="stime" contenteditable="false" spellcheck="false">All day</span>
+              <span class="sevent" contenteditable="false" spellcheck="false">
+                <strong>Excursion to Tongmu Pass</strong> — 考察桐木關<br>
+                Deep into the Wuyishan Nature Reserve, about 1.5–2 hours from the city. Tongmu Pass is where Lapsang Souchong (正山小種) was created — the world's first black tea, discovered here in the 17th century when passing soldiers forced the drying of tea leaves over pine fires, accidentally producing the smoke-cured style that would eventually become the model for all black tea globally.<br><br></span>
+            </div>
+          </div>
+          <div class="day-tags">
+            </div>
+        </div>
+      </div>
+    </div><!-- /ch-wuyi -->
+
+    <!-- ── TRAVEL DAY ── -->
+    <div class="ch-travel">
+      <div class="chapter-head"><h3 contenteditable="false" spellcheck="false">Travel day · Oct 28 (Wed) · Wuyishan → Jingdezhen</h3></div>
+      <div class="travel-bridge">
+        <div class="travel-bridge-side">
+          <p class="travel-bridge-label" contenteditable="false" spellcheck="false">Day 5<br>Wednesday<br>Oct 28</p>
+        </div>
+        <div class="travel-bridge-body" contenteditable="false" spellcheck="false">
+          <strong>09:00</strong> — Train departs Wuyishan North (武夷山北站). Arrive Jingdezhen approximately 10:00. Check in and settle. <strong>Lunch.</strong> Afternoon programme begins in Jingdezhen — see Day 5 below.
+        </div>
+      </div>
+    </div>
+
+    <!-- ── JINGDEZHEN ── -->
+    <div class="ch-jdz">
+      <div class="chapter-head"><h3 contenteditable="false" spellcheck="false">Jingdezhen, Jiangxi (景德鎮) · Days 5–8 · Oct 28–31</h3></div>
+
+      <!-- DAY 5 -->
+      <div class="day-card">
+        <div class="day-side">
+          <div class="day-num" style="color:rgba(86,138,134,0.45)">5</div>
+          <div class="day-date" contenteditable="false" spellcheck="false">Wednesday<br>Oct 28</div>
+        </div>
+        <div class="day-body">
+          <div class="day-title-row">
+            <h3 class="day-title" contenteditable="false" spellcheck="false">Arrival &amp; Imperial Kiln Site</h3>
+          </div>
+          <div class="sched">
+            <div class="srow"><span class="stime" contenteditable="false" spellcheck="false">09:00</span><span class="sevent" contenteditable="false" spellcheck="false">Train departs Wuyishan. Arrive Jingdezhen ~10:00. Check in</span></div>
+            <div class="srow">
+              <span class="stime" contenteditable="false" spellcheck="false">PM</span>
+              <span class="sevent" contenteditable="false" spellcheck="false">
+                <strong>Taoyang Li Imperial Kiln Museum and site</strong>&nbsp; — 陶陽里御窯博物館<br>
+                Built over actual Ming and Qing dynasty (明清) imperial kiln ruins. Understand the production system of the imperial kilns and the history of royal-use porcelain. View precious excavated ceramics and key archaeological finds<br><br><strong>Nanlu Ruins</strong> — 南麓遺址<br>
+                The imperial kiln factory excavation site — key archaeological discoveries spanning Jingdezhen's thousand-year manufacturing history<br><br><strong>Longzhu Pavilion</strong> — 龍珠閣<br>
+                Overlook the old city of Jingdezhen and the imperial kiln district from above
+              </span>
+            </div>
+            <div class="srow">
+              <span class="stime" contenteditable="false" spellcheck="false"><br></span>
+              <span class="sevent" contenteditable="false" spellcheck="false">
+                <strong>Xu Family Wood-fired Kiln</strong> — 徐家柴窯<br>
+                A kiln built in the late Ming dynasty (明末), operating for over 300 years. Rebuilt and re-fired in 2016 after nearly 40 years dormant. Understand traditional wood-firing technique and kiln structure; learn how pine-fired heat shapes porcelain texture and glaze colour in ways no electric or gas kiln can replicate.<br></span>
+            </div>
+          </div>
+          <div class="day-tags">
+          </div>
+        </div>
+      </div>
+
+      <!-- DAY 6 -->
+      <div class="day-card">
+        <div class="day-side">
+          <div class="day-num" style="color:rgba(86,138,134,0.45)">6</div>
+          <div class="day-date" contenteditable="false" spellcheck="false">Thursday<br>Oct 29</div>
+        </div>
+        <div class="day-body">
+          <div class="day-title-row">
+            <h3 class="day-title" contenteditable="false" spellcheck="false">Ceramics Museum &amp; Mr. Zhang's Workshop</h3>
+          </div>
+          <div class="sched">
+            <div class="srow">
+              <span class="stime" contenteditable="false" spellcheck="false">AM</span>
+              <span class="sevent" contenteditable="false" spellcheck="false">
+                <strong>Jingdezhen Ceramics Museum</strong> — 景德鎮陶瓷博物館<br>
+                Systematically trace Jingdezhen's thousand-year manufacturing history. Appreciate masterworks and the evolution of technique across dynasties, Song celadon, Yuan blue-and-white, Ming imperial ware, Qing famille rose. Build a complete historical foundation before entering working studios
+              </span>
+            </div>
+            <div class="srow">
+              <span class="stime" contenteditable="false" spellcheck="false">PM</span>
+              <span class="sevent" contenteditable="false" spellcheck="false">
+                <strong>Mr. Zhang's Workshop</strong> — 張先生工作坊 · Xindu Ceramics Garden (新都陶瓷園)<br>A small-scale handmade ceramics workshop operating at the intersection of craft and commerce. Follow the production flow from form to firing, and explore how contemporary functional ware navigates the balance between artistic intention and market reality. We'll time our visit to coincide with a gas kiln unloading, if the schedule aligns.</span>
+            </div>
+          </div>
+          <div class="day-tags">
+          </div>
+        </div>
+      </div>
+
+      <!-- DAY 7 -->
+      <div class="day-card">
+        <div class="day-side">
+          <div class="day-num" style="color:rgba(86,138,134,0.45)">7</div>
+          <div class="day-date" contenteditable="false" spellcheck="false">Friday<br>Oct 30</div>
+        </div>
+        <div class="day-body">
+          <div class="day-title-row">
+            <h3 class="day-title" contenteditable="false" spellcheck="false">Artist Studios &amp; Hands-on Making</h3>
+          </div>
+          <div class="sched">
+            <div class="srow">
+              <span class="stime" contenteditable="false" spellcheck="false">AM</span>
+              <span class="sevent" contenteditable="false" spellcheck="false">
+                <strong>Zhan Bing Studio</strong> — 占冰工作室 · near Sculpture Ceramics Factory (雕塑瓷廠)<br>
+                An ICH artist working in blue-and-white underglaze red (青花釉裡紅). Visit the creative space, understand the technical demands of underglaze red,&nbsp; one of the most difficult techniques in Chinese ceramics, and learn how Master Zhan 's personal philosophy shapes the work<br><br>
+                <strong>Yi Zhi Studio</strong> — 一之工作室 · near Sanlei Ceramics (三蕾瓷用化工)<br>
+                A contemporary teapot artist's studio. Learn his process from design through forming to firing, and see work that breaks through from the traditional craft to a modern approach.</span>
+            </div>
+            <div class="srow">
+              <span class="stime" contenteditable="false" spellcheck="false">PM</span>
+              <span class="sevent" contenteditable="false" spellcheck="false">
+                <strong>Tao Xi Chuan Ceramics Workshop</strong> — 陶溪川陶公塾 · 瓷星人做陶<br>&nbsp;Make pottery yourself,&nbsp; throw on the wheel, hand-build, or try basic forming techniques with instruction.&nbsp;</span>
+            </div>
+            <div class="srow"><span class="stime" contenteditable="false" spellcheck="false"><br></span><span class="sevent" contenteditable="false" spellcheck="false"><strong>Tao Xi Chuan Night Market</strong> — 陶溪川市集 · Ceramics, craft, artists at work, and the city at its most lively</span></div>
+          </div>
+          <div class="day-tags">
+          </div>
+        </div>
+      </div>
+
+      <!-- DAY 8 -->
+      <div class="day-card">
+        <div class="day-side">
+          <div class="day-num" style="color:rgba(86,138,134,0.45)">8</div>
+          <div class="day-date" contenteditable="false" spellcheck="false">Saturday<br>Oct 31</div>
+        </div>
+        <div class="day-body">
+          <div class="day-title-row">
+            <h3 class="day-title" contenteditable="false" spellcheck="false">Sanbao Village &amp; Closing Tea Ceremony</h3>
+          </div>
+          <div class="sched">
+            <div class="srow">
+              <span class="stime" contenteditable="false" spellcheck="false">AM</span>
+              <span class="sevent" contenteditable="false" spellcheck="false">
+                <strong>Wang Xinghua &amp; Shi Yue Studio</strong> — 王興華・施玥工作室 · Sanbao Village (三寶村)<br>
+                Two artists' shared creative space — visit the studio, understand their ceramic practice and philosophy<br><br>
+                <strong>Sanbao Art Cluster</strong> — 三宝蓬艺术聚落<br>
+                A gathering of studios and galleries in the village, one of the more contemplative corners of Jingdezhen's ceramic world<br></span>
+            </div>
+            <div class="srow">
+              <span class="stime" contenteditable="false" spellcheck="false">PM</span>
+              <span class="sevent" contenteditable="false" spellcheck="false">
+                <strong>Qi Yi Studio</strong> — 其奕工作室 · Liukeng Wu (流坑坞)<br>
+                A conversation with the creator. Understand how different generations of Jingdezhen ceramic artists approach their work, and what changes — and what doesn't — across those generations<br><br>
+                <strong>Zhiyin Tea Gathering</strong> — 知音茶會<br>
+                以茶會友 — Making friends through tea<br>
+                A closing ceremony: tea and vessels together, the two things this journey has been about, brought into the same moment. A fitting close to nine days between leaf and clay.
+              </span>
+            </div>
+          </div>
+          <div class="day-tags">
+          </div>
+        </div>
+      </div>
+
+      <!-- DAY 9 -->
+      <div class="day-card">
+        <div class="day-side">
+          <div class="day-num" style="color:rgba(86,138,134,0.45)">9</div>
+          <div class="day-date" contenteditable="false" spellcheck="false">Sunday<br>Nov 1</div>
+        </div>
+        <div class="day-body">
+          <div class="day-title-row">
+            <h3 class="day-title" contenteditable="false" spellcheck="false">Breakfast &amp; Departures</h3>
+          </div>
+          <div class="sched">
+            <div class="srow"><span class="stime" contenteditable="false" spellcheck="false">AM</span><span class="sevent" contenteditable="false" spellcheck="false"><strong>Breakfast</strong> — last shared meal, then send-off to train station&nbsp;</span></div>
+          </div>
+          <div class="day-tags">
+          </div>
+        </div>
+      </div>
+
+    </div><!-- /ch-jdz -->
+  </div>
+</section>
+
+<!-- ════════════════════════════════════════
+     PARTICIPANTS
+════════════════════════════════════════ -->
+<section id="participants" class="">
+  <div class="section-inner">
+    <span class="s-zh" style="color:var(--qt)" contenteditable="false" spellcheck="false">同行者</span>
+    <h2 class="s-title" contenteditable="false" spellcheck="false">Participants</h2>
+    <div class="participants-grid">
+
+      <div class="participant">
+        <h3 class="p-name" contenteditable="false" spellcheck="false">Amy</h3>
+        <span class="p-handle" contenteditable="false" spellcheck="false">@lit.infusions</span>
+        <div class="p-div"></div>
+        <p class="p-bio" contenteditable="false" spellcheck="false">Hi everyone! I got into tea about three years ago after a trip to Jingmai Mountain, Yunnan with a friend, and I've been happily falling down the tea rabbit hole ever since.<br><br>Back in Vancouver, I've been lucky to find a wonderful tea community, thanks in part to Claudia's workshops, which have made the journey even more rewarding.<br><br>I can't wait to meet you all, share stories, and create new memories together over tea!</p>
+      </div>
+
+      <div class="participant">
+        <h3 class="p-name" contenteditable="false" spellcheck="false">Ariel</h3>
+        <span class="p-handle" contenteditable="false" spellcheck="false">@arieldrinkstea</span>
+        <div class="p-div"></div>
+        <p class="p-bio" contenteditable="false" spellcheck="false">Hello everyone! My name is Ariel and I'm thrilled to be sharing this tea journey with you all! I am a Sagittarius, ENTJ, and train Muay Thai (yes, I can help you with your luggages). I've been making pottery for nearly 2 decades (although there's still a lot to learn) and have been dedicated to tea for a long time now. It's my first time on a tea tour like this and as excited as I am to learn more about tea and the culture around it, I'm really looking forward to getting to know you all!</p>
+      </div>
+
+      <div class="participant">
+        <h3 class="p-name" contenteditable="false" spellcheck="false">Chloe</h3>
+        <span class="p-handle" contenteditable="false" spellcheck="false">@fitsmetoatea</span>
+        <div class="p-div"></div>
+        <p class="p-bio" contenteditable="false" spellcheck="false">Hi I'm Chloe, a tea enthusiast from Singapore. I love reading and travelling, and get curious about a lot of things and tend to go down random rabbit holes, whether it's history, architecture, food, or how a place came to be the way it is.</p>
+      </div>
+
+      <div class="participant">
+        <h3 class="p-name" contenteditable="false" spellcheck="false">Christine</h3>
+        <span class="p-handle" contenteditable="false" spellcheck="false">@chrissycream</span>
+        <div class="p-div"></div>
+        <p class="p-bio" contenteditable="false" spellcheck="false">Went to Wuyi at the beginning of the year and coming back for more!!!</p>
+      </div>
+
+      <div class="participant">
+        <h3 class="p-name" contenteditable="false" spellcheck="false">Jan</h3>
+        <span class="p-handle" contenteditable="false" spellcheck="false">@jansnochanoma</span>
+        <div class="p-div"></div>
+        <p class="p-bio" contenteditable="false" spellcheck="false">Hello! I'm 99% sure everyone knows who I am, so no need for an introduction here. See you all soon! - Jan</p>
+      </div>
+
+      <div class="participant">
+        <h3 class="p-name" contenteditable="false" spellcheck="false">Ju</h3>
+        <span class="p-handle" contenteditable="false" spellcheck="false">@onewontdo</span>
+        <div class="p-div"></div>
+        <p class="p-bio" contenteditable="false" spellcheck="false">Looking forward to sharing my passion and love for tea, art and other things adjacent!</p>
+      </div>
+
+      <div class="participant">
+        <h3 class="p-name" contenteditable="false" spellcheck="false">Paola</h3>
+        <span class="p-handle" contenteditable="false" spellcheck="false">@psimhere2</span>
+        <div class="p-div"></div>
+        <p class="p-bio" contenteditable="false" spellcheck="false">I'm originally from Mexico but now call Vancouver home. In Vancouver, I spend my time in nature, cooking food, gardening, and seeing my friends. Outside of Vancouver, you will find me diving, trekking, and enjoying local food/culture.</p>
+      </div>
+
+      <div class="participant">
+        <h3 class="p-name" contenteditable="false" spellcheck="false">Yuna</h3>
+        <span class="p-handle" contenteditable="false" spellcheck="false">@yuleenana</span>
+        <div class="p-div"></div>
+        <p class="p-bio" contenteditable="false" spellcheck="false">Yuna, an avid tea enthusiast based in Seattle, Washington. While I am a software engineer by trade, I more deeply identify with my more creative pursuits—tea, ceramics, design, and music. I'd love to one day open a tea house in Seattle. In my spare time, I love organizing tea-centric events and gatherings and bringing people together in meaningful ways. Tea can be such a powerful catalyst for creativity and connection. Very much looking forward to be enamored and overwhelmed by the giant world of Chinese tea! :)</p>
+      </div>
+
+    </div>
+  </div>
+</section>
+
+<!-- ════════════════════════════════════════
+     THINGS TO KNOW BEFORE
+════════════════════════════════════════ -->
+<section id="before" class="">
+  <div class="section-inner">
+    <span class="s-zh" style="color:var(--qt)" contenteditable="false" spellcheck="false">出发前准备</span>
+    <h2 class="s-title" contenteditable="false" spellcheck="false">Things to know before</h2>
+
+    <div class="priority-box">
+      <div class="priority-box-mark">!</div>
+      <div>
+        <strong>Install WeChat — do this now</strong>
+        <p contenteditable="false" spellcheck="false">WeChat is how we communicate as a group, how you pay for almost everything in China, and how you access DiDi (rides) and Mei Tuan (food delivery and local services). Set it up before you leave and <strong>link your credit card to WeChat Pay</strong> before the trip. Also link a card to <strong>Alipay</strong> as a backup — both WeChat Pay and Alipay now accept international Visa and Mastercard.</p>
+      </div>
+    </div>
+
+    <div class="know-grid">
+      <div class="know-block">
+        <h3 contenteditable="false" spellcheck="false">Travel documents</h3>
+        <ul>
+          <li contenteditable="false" spellcheck="false"><strong>Passport</strong> — valid at least 6 months beyond November 1, 2026</li>
+          <li contenteditable="false" spellcheck="false"><strong>Chinese visa</strong> — many nationalities now qualify for visa-free entry. Confirm your eligibility. This policy changes frequently — verify with a recent source, not information older than a few months</li>
+          <li contenteditable="false" spellcheck="false"><strong>Travel insurance</strong> — required. Should cover medical, cancellation, and lost luggage</li>
+          <li contenteditable="false" spellcheck="false"><strong>Printed copies</strong> — carry printed copies of passport, visa, and insurance. Accommodation registration requires your passport at every check-in</li>
+        </ul>
+      </div>
+
+      <div class="know-block">
+        <h3 contenteditable="false" spellcheck="false">Apps to install</h3>
+        <ul>
+          <li contenteditable="false" spellcheck="false"><strong>WeChat</strong> — communication, payments, QR codes, DiDi, Mei Tuan. The most essential app for China</li>
+          <li contenteditable="false" spellcheck="false"><strong>Alipay</strong> — secondary payments. Link an international card before you arrive</li>
+          <li contenteditable="false" spellcheck="false"><strong>VPN</strong> — install and test before landing. Cannot be downloaded once inside China. Google, Instagram, and most Western apps are blocked without one</li>
+          <li contenteditable="false" spellcheck="false"><strong>Amap (高德地图)</strong> — China's standard mapping app. Google Maps does not work reliably</li>
+        </ul>
+        <div class="warn-box">Set up all apps and test your VPN before you land. Once in China, you are behind the Great Firewall and cannot download blocked services.</div>
+      </div>
+
+      <div class="know-block">
+        <h3 contenteditable="false" spellcheck="false">Data &amp; SIM</h3>
+        <ul>
+          <li contenteditable="false" spellcheck="false"><strong>eSIM (recommended)</strong> — Trip.com sells China-compatible eSIMs that are easy to install before departure. Arrive already connected. Works with most modern unlocked phones</li>
+          <li contenteditable="false" spellcheck="false"><strong>Physical SIM at the airport</strong> — available from China Mobile and China Unicom on arrival, requires passport. Note: by the time you buy it at the airport, you are already behind the Firewall — install any VPNs and apps before landing</li>
+          <li contenteditable="false" spellcheck="false"><strong>International roaming</strong> — works, but data costs can be high. Check your carrier's China plan before departure</li>
+        </ul>
+        <div class="note-box">The group WeChat runs all logistics throughout the trip. A working data connection from Day 1 is important.</div>
+      </div>
+
+      <div class="know-block">
+        <h3 contenteditable="false" spellcheck="false">Money</h3>
+        <ul>
+          <li contenteditable="false" spellcheck="false"><strong>WeChat Pay and Alipay</strong> — nearly all transactions in China: street food, markets, temples, taxis. Link an international Visa or Mastercard before you arrive</li>
+          <li contenteditable="false" spellcheck="false"><strong>Cash RMB (¥)</strong> — carry some. ¥500–1,000 in small bills covers older establishments and rural spots that don't take mobile payment</li>
+          <li contenteditable="false" spellcheck="false"><strong>ATMs</strong> — Bank of China and ICBC are most reliable for international cards. Notify your bank before departure to avoid security blocks</li>
+        </ul>
+      </div>
+
+      <div class="know-block">
+        <h3 contenteditable="false" spellcheck="false">Weather &amp; packing</h3>
+        <ul>
+          <li contenteditable="false" spellcheck="false"><strong>Wuyishan</strong> — 13–22°C (55–72°F). Cooler mornings and evenings, perfect for hiking through the tea mountains. October is one of the drier, more comfortable months</li>
+          <li contenteditable="false" spellcheck="false"><strong>Jingdezhen</strong> — 10–25°C (50–77°F), dropping noticeably toward end of October</li>
+          <li contenteditable="false" spellcheck="false"><strong>Layers</strong> — the gap between morning and afternoon is real. Light down or fleece, breathable mid-layers</li>
+          <li contenteditable="false" spellcheck="false"><strong>Windbreaker</strong> — useful on the river raft and mountain trails</li>
+          <li contenteditable="false" spellcheck="false"><strong>Comfortable walking shoes</strong> — cobblestones, trails, studio paths. Comfort over style</li>
+        </ul>
+      </div>
+
+      <div class="know-block">
+        <h3 contenteditable="false" spellcheck="false">Health &amp; practical</h3>
+        <ul>
+          <li contenteditable="false" spellcheck="false"><strong>Medications</strong> — bring a sufficient supply. Include a note or prescription if possible</li>
+          <li contenteditable="false" spellcheck="false"><strong>Physical level</strong> — easy to moderate. No vigorous hiking.</li>
+          <li contenteditable="false" spellcheck="false"><strong>Electricity</strong> — 220V, Type A/C/I outlets. Most devices charge via USB. Universal adapter recommended</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ════════════════════════════════════════
+     GETTING TO WUYISHAN OCT 24
+════════════════════════════════════════ -->
+<!--deleted-->
+
+<!-- ════════════════════════════════════════
+     QUICK REFERENCE
+════════════════════════════════════════ -->
+<section id="quick-ref" class="">
+  <div class="section-inner">
+    <span class="s-zh" contenteditable="false" spellcheck="false">快速参考</span>
+    <h2 class="s-title" contenteditable="false" spellcheck="false">Quick reference</h2>
+
+    <div class="qr-grid">
+
+      <div class="qr-block">
+        <h3 contenteditable="false" spellcheck="false">Accommodation</h3>
+        <div class="qr-row-item"><span class="qr-label" contenteditable="false" spellcheck="false">Hotel — Wuyishan</span><span class="qr-val qr-tbc" contenteditable="false" spellcheck="false">隐山堂茶美学空间</span></div>
+        <div class="qr-row-item"><span class="qr-label" contenteditable="false" spellcheck="false">Hotel — Jingdezhen</span><span class="qr-val qr-tbc" contenteditable="false" spellcheck="false">溪川行廬</span></div>
+      </div>
+
+      <div class="qr-block">
+        <h3 contenteditable="false" spellcheck="false">Transport</h3>
+        <div class="qr-row-item"><span class="qr-label" contenteditable="false" spellcheck="false">Wuyishan station</span><span class="qr-val" contenteditable="false" spellcheck="false">武夷山北站 (North)</span></div>
+        <div class="qr-row-item"><span class="qr-label" contenteditable="false" spellcheck="false">Wuyishan airport</span><span class="qr-val" contenteditable="false" spellcheck="false">WUS</span></div>
+        <div class="qr-row-item"><span class="qr-label" contenteditable="false" spellcheck="false">Jingdezhen station</span><span class="qr-val" contenteditable="false" spellcheck="false">景德镇北站 (North)</span></div>
+        <div class="qr-row-item"><span class="qr-label" contenteditable="false" spellcheck="false">Rides</span><span class="qr-val" contenteditable="false" spellcheck="false">DiDi (via WeChat)</span></div>
+      </div>
+
+      <!--deleted-->
+
+      <div class="qr-block">
+        <h3 contenteditable="false" spellcheck="false">Emergency numbers</h3>
+        <ul class="emergency-list">
+          <li><span class="em-label" contenteditable="false" spellcheck="false">Police</span><span class="em-num" contenteditable="false" spellcheck="false">110</span></li>
+          <li><span class="em-label" contenteditable="false" spellcheck="false">Ambulance</span><span class="em-num" contenteditable="false" spellcheck="false">120</span></li>
+          <li><span class="em-label" contenteditable="false" spellcheck="false">Fire</span><span class="em-num" contenteditable="false" spellcheck="false">119</span></li>
+          <li><span class="em-label" contenteditable="false" spellcheck="false">Tourist helpline</span><span class="em-num" contenteditable="false" spellcheck="false">12301</span></li>
+        </ul>
+      </div>
+
+      <div class="qr-block">
+        <h3 contenteditable="false" spellcheck="false">Payments &amp; practical</h3>
+        <div class="qr-row-item"><span class="qr-label" contenteditable="false" spellcheck="false">Currency</span><span class="qr-val" contenteditable="false" spellcheck="false">RMB (¥)</span></div>
+        <div class="qr-row-item"><span class="qr-label" contenteditable="false" spellcheck="false">Mobile payment</span><span class="qr-val" contenteditable="false" spellcheck="false">WeChat Pay · Alipay</span></div>
+        <div class="qr-row-item"><span class="qr-label" contenteditable="false" spellcheck="false">Time zone</span><span class="qr-val" contenteditable="false" spellcheck="false">UTC+8 (CST)</span></div>
+        <div class="qr-row-item"><span class="qr-label" contenteditable="false" spellcheck="false">Electricity</span><span class="qr-val" contenteditable="false" spellcheck="false">220V · Type A/C/I</span></div>
+        <div class="qr-row-item"><span class="qr-label" contenteditable="false" spellcheck="false">Language</span><span class="qr-val" contenteditable="false" spellcheck="false">Mandarin (普通话)</span></div>
+      </div>
+
+      <div class="qr-block">
+        <h3 contenteditable="false" spellcheck="false">Key apps</h3>
+        <div class="qr-row-item"><span class="qr-label" contenteditable="false" spellcheck="false">Communication + pay</span><span class="qr-val" contenteditable="false" spellcheck="false">WeChat</span></div>
+        <div class="qr-row-item"><span class="qr-label" contenteditable="false" spellcheck="false">Backup payment</span><span class="qr-val" contenteditable="false" spellcheck="false">Alipay</span></div>
+        <div class="qr-row-item"><span class="qr-label" contenteditable="false" spellcheck="false">Rides</span><span class="qr-val" contenteditable="false" spellcheck="false">DiDi (via WeChat)</span></div>
+        <div class="qr-row-item"><span class="qr-label" contenteditable="false" spellcheck="false">Maps</span><span class="qr-val" contenteditable="false" spellcheck="false">Amap (高德地图)</span></div>
+        <div class="qr-row-item"><span class="qr-label" contenteditable="false" spellcheck="false">eSIM</span><span class="qr-val" contenteditable="false" spellcheck="false">Trip.com</span></div>
+        <div class="qr-row-item"><span class="qr-label" contenteditable="false" spellcheck="false">Train booking</span><span class="qr-val" contenteditable="false" spellcheck="false">12306 · Trip.com</span></div>
+      </div>
+
+    </div>
+
+    <div class="deadline-box">
+    </div>
+  </div>
+</section>
+
+<footer>
+  <p class="footer-l" contenteditable="false" spellcheck="false">Between Leaf &amp; Clay · Oct 24–Nov 1, 2026 · Curated by Claudia Tse&nbsp; littlesojourn.com</p>
+  <p class="footer-r" contenteditable="false" spellcheck="false">茶器之間 · 武夷山 · 景德镇</p>
+</footer>
+
+<script>
+  const nav = document.getElementById('main-nav');
+  window.addEventListener('scroll', () => {
+    nav.classList.toggle('scrolled', window.scrollY > 80);
+  });
+</script>
+
+<script>
+/* ════════════════════════════════════════
+   EDIT MODE ENGINE
+════════════════════════════════════════ */
+let editMode = false;
+
+const DELETABLE_SELECTORS = [
+  /* Full page sections */
+  '#itin', '#participants', '#before', '#getting-there', '#quick-ref',
+  /* Landing sub-sections */
+  '.intro-section', '.destinations', '.hosts-section',
+  /* Chapter headers */
+  '.chapter-head',
+  /* Itinerary cards */
+  '.day-card', '.travel-bridge',
+  /* Jingdezhen / Wuyi chapter wrappers */
+  '.ch-wuyi', '.ch-jdz', '.ch-travel',
+  /* Participant cards */
+  '.participant',
+  /* Before blocks */
+  '.know-block',
+  /* Getting there blocks */
+  '.getting-block',
+  /* Quick ref blocks */
+  '.qr-block',
+  /* Destination panels */
+  '.dest',
+  /* Host cards */
+  '.host',
+  /* Hero facts */
+  '.hf',
+  /* Priority box */
+  '.priority-box',
+];
+
+const EDITABLE_SELECTORS = [
+  'p', 'h1', 'h2', 'h3', 'h4',
+  '.hero-title', '.hf-value', '.hf-label',
+  '.s-title', '.s-zh',
+  '.day-title', '.day-note', '.day-date',
+  '.stime', '.sevent',
+  '.chapter-head h3',
+  '.p-name', '.p-handle', '.p-bio',
+  '.host-name', '.host-zh', '.host-role', '.host-body',
+  '.dest-title', '.dest-zh',
+  '.know-block h3', '.know-block ul li',
+  '.getting-block h3', '.getting-block p', '.getting-block ul li',
+  '.qr-block h3', '.qr-label', '.qr-val',
+  '.em-label', '.em-num',
+  '.travel-bridge-label', '.travel-bridge-body',
+  '.intro-quote',
+  '.itin-note', '.hero-sub',
+  '.deadline-box p',
+  '.action-box p',
+  'td', 'th',
+  '.tag',
+  '.footer-l', '.footer-r',
+];
+
+function addDeleteButtons() {
+  DELETABLE_SELECTORS.forEach(sel => {
+    document.querySelectorAll(sel).forEach(el => {
+      if (el.querySelector(':scope > .del-btn')) return;
+      el.classList.add('deletable');
+      const btn = document.createElement('button');
+      btn.className = 'del-btn';
+      btn.innerHTML = '×';
+      btn.title = 'Delete this block';
+      btn.addEventListener('click', e => {
+        e.stopPropagation();
+        e.preventDefault();
+        const target = el;
+        target.style.transition = 'opacity 0.15s';
+        target.style.opacity = '0.35';
+        const undo = document.getElementById('undo-delete');
+        const placeholder = document.createComment('deleted');
+        target.parentNode.insertBefore(placeholder, target);
+        target.remove();
+        lastDeleted = { el: target, placeholder };
+        if (undo) {
+          undo.style.display = 'inline-block';
+          clearTimeout(undoTimer);
+          undoTimer = setTimeout(() => {
+            undo.style.display = 'none';
+            lastDeleted = null;
+          }, 5000);
+        }
+      });
+      el.appendChild(btn);
+    });
+  });
+}
+
+let lastDeleted = null;
+let undoTimer = null;
+
+function undoDelete() {
+  if (!lastDeleted) return;
+  const { el, placeholder } = lastDeleted;
+  el.style.opacity = '';
+  placeholder.parentNode.insertBefore(el, placeholder);
+  placeholder.remove();
+  lastDeleted = null;
+  const undo = document.getElementById('undo-delete');
+  if (undo) undo.style.display = 'none';
+}
+
+function enableEditing() {
+  EDITABLE_SELECTORS.forEach(sel => {
+    document.querySelectorAll(sel).forEach(el => {
+      if (el.closest('nav') || el.closest('.edit-notice') || el.classList.contains('del-btn')) return;
+      el.contentEditable = 'true';
+      el.spellcheck = false;
+    });
+  });
+}
+
+function disableEditing() {
+  document.querySelectorAll('[contenteditable="true"]').forEach(el => {
+    el.contentEditable = 'false';
+  });
+}
+
+function toggleEdit() {
+  editMode = !editMode;
+  document.body.classList.toggle('edit-mode', editMode);
+  const btn = document.getElementById('edit-toggle');
+  btn.textContent = editMode ? 'Done' : 'Edit';
+  if (editMode) {
+    enableEditing();
+  } else {
+    disableEditing();
+  }
+}
+
+function downloadPage() {
+  /* Clean state for export */
+  disableEditing();
+  document.body.classList.remove('edit-mode');
+  document.querySelectorAll('.del-btn').forEach(b => b.remove());
+  document.querySelectorAll('.deletable').forEach(el => el.classList.remove('deletable'));
+  const notice = document.querySelector('.edit-notice');
+  const editControls = document.querySelector('.edit-controls');
+  if (notice) notice.remove();
+  if (editControls) editControls.remove();
+
+  const html = '<!DOCTYPE html>\n' + document.documentElement.outerHTML;
+  const blob = new Blob([html], { type: 'text/html; charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'between-leaf-and-clay.html';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+
+  /* Reload to restore edit UI */
+  setTimeout(() => location.reload(), 500);
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  addDeleteButtons();
+  toggleEdit(); // auto-start in edit mode
+
+  /* Notice bar */
+  const notice = document.createElement('div');
+  notice.className = 'edit-notice';
+  notice.innerHTML = `
+    <span>Edit mode on</span>
+    <span>Click any text to edit  ·  <span style="color:rgba(180,50,50,0.7)">×</span> to delete a block</span>
+    <button id="undo-delete" onclick="undoDelete()" style="display:none;font-family:inherit;font-size:11px;letter-spacing:0.08em;text-transform:uppercase;padding:0.25rem 0.7rem;border:1px solid rgba(86,138,134,0.5);background:transparent;color:#568A86;cursor:pointer;">Undo</button>
+    <span style="margin-left:auto;opacity:0.4">↑ Save to keep changes</span>
+  `;
+  document.body.appendChild(notice);
+});
+
+/* ── SMOOTH SCROLL WITH NAV OFFSET ── */
+document.querySelectorAll('a[href^="#"]').forEach(link => {
+  link.addEventListener('click', function(e) {
+    const href = this.getAttribute('href');
+    if (href === '#') return;
+    const target = document.querySelector(href);
+    if (!target) return;
+    e.preventDefault();
+    const navHeight = document.getElementById('main-nav').offsetHeight;
+    const top = target.getBoundingClientRect().top + window.scrollY - navHeight - 8;
+    window.scrollTo({ top, behavior: 'smooth' });
+  });
+});
+</script>
+
+
+
+</body></html>
